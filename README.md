@@ -103,4 +103,4 @@ profiles are especially welcome — see `CONTRIBUTING.md`.
 
 ## License
 
-TBD
+Apache-2.0 license
