@@ -252,6 +252,42 @@ def float32_to_pydub(audio: "np.ndarray", sr: int, sample_width: int = 2) -> Aud
     )
 
 
+
+def resample_audio(
+    audio: "np.ndarray",
+    orig_sr: int,
+    target_sr: int,
+) -> "np.ndarray":
+    """Resample float32 audio from orig_sr to target_sr.
+
+    Prefers scipy.signal.resample_poly for quality; falls back to
+    linear interpolation when scipy is unavailable. No-op when rates match.
+    """
+    if not CAP.numpy or orig_sr == target_sr or len(audio) == 0:
+        return audio
+
+    if CAP.scipy:
+        from math import gcd
+        from scipy.signal import resample_poly
+        g = gcd(int(target_sr), int(orig_sr))
+        up, down = int(target_sr) // g, int(orig_sr) // g
+        # resample_poly operates along axis 0
+        return resample_poly(audio, up, down, axis=0).astype(np.float32)
+
+    # Linear-interpolation fallback
+    n_out = int(round(len(audio) * target_sr / orig_sr))
+    if n_out <= 0:
+        return audio
+    xp = np.linspace(0.0, 1.0, len(audio), endpoint=False)
+    xq = np.linspace(0.0, 1.0, n_out, endpoint=False)
+    if audio.ndim == 1:
+        return np.interp(xq, xp, audio).astype(np.float32)
+    channels = [
+        np.interp(xq, xp, audio[:, ch]) for ch in range(audio.shape[1])
+    ]
+    return np.stack(channels, axis=1).astype(np.float32)
+
+
 def apply_restoration_filters(
     input_path: Path,
     output_path: Path,
@@ -592,6 +628,71 @@ def _eq_pydub_fallback(
 
 # --- B.4 Compressor (dual attack/release envelope follower, fixed) ---
 
+def _ema_envelope_fast(level_sq: "np.ndarray", sr: int,
+                       attack_ms: float, release_ms: float) -> "np.ndarray":
+    """Dual-coefficient EMA envelope follower.
+
+    Prefer a numba-accelerated inner loop when available; otherwise use a
+    vectorised frame-based approximation that is ~50–100× faster than a
+    pure-Python sample loop on long files while preserving attack/release
+    character closely enough for mastering use.
+    """
+    n = len(level_sq)
+    tau_att = math.exp(-1.0 / max(sr * attack_ms / 1000.0, 1e-9))
+    tau_rel = math.exp(-1.0 / max(sr * release_ms / 1000.0, 1e-9))
+
+    # Optional numba path (same algorithm, compiled)
+    try:
+        import numba as nb  # type: ignore
+
+        @nb.njit(cache=True)
+        def _loop(ls, ta, tr):
+            out = np.empty(ls.shape[0], dtype=np.float32)
+            lvl = 0.0
+            for i in range(ls.shape[0]):
+                target = float(ls[i])
+                coef = ta if target > lvl else tr
+                lvl = coef * lvl + (1.0 - coef) * target
+                out[i] = lvl
+            return out
+
+        return _loop(level_sq.astype(np.float32), tau_att, tau_rel)
+    except Exception:
+        pass
+
+    # Frame-based vectorised approximation:
+    # 1. RMS energy per short hop (≈ attack/4, min 1 sample)
+    # 2. Sequential EMA only over the much smaller frame array
+    # 3. Linear upsample back to sample rate
+    hop = max(1, int(sr * max(attack_ms, 1.0) / 1000.0 / 4.0))
+    n_frames = (n + hop - 1) // hop
+    # Pad so reshape is clean
+    pad = n_frames * hop - n
+    if pad:
+        padded = np.pad(level_sq, (0, pad), mode="edge")
+    else:
+        padded = level_sq
+    frames = padded.reshape(n_frames, hop).mean(axis=1)
+
+    env_f = np.empty(n_frames, dtype=np.float32)
+    lvl = 0.0
+    # Frame-rate coefficients (hop samples per step)
+    ta_f = tau_att ** hop
+    tr_f = tau_rel ** hop
+    for i in range(n_frames):
+        target = float(frames[i])
+        coef = ta_f if target > lvl else tr_f
+        lvl = coef * lvl + (1.0 - coef) * target
+        env_f[i] = lvl
+
+    # Upsample with linear interpolation
+    positions = np.linspace(0, n_frames - 1, n, dtype=np.float64)
+    idx0 = np.floor(positions).astype(np.int64)
+    idx1 = np.minimum(idx0 + 1, n_frames - 1)
+    frac = (positions - idx0).astype(np.float32)
+    return (env_f[idx0] * (1.0 - frac) + env_f[idx1] * frac).astype(np.float32)
+
+
 def compress(
     audio: "np.ndarray",
     sr: int,
@@ -604,13 +705,10 @@ def compress(
     """Feed-forward RMS compressor with separate attack/release time
     constants and a soft knee, operating on float32 audio.
 
-    Threshold is anchored to peak - 12dB so it reliably engages on
-    dynamic material (a threshold set to the average level of dynamic
-    material sits right at the loud section's own level and never fires).
-
-    The compressor operates at sample rate (not frame rate) for accurate
-    time constants, using an exponential moving average (EMA) to smooth
-    the gain reduction signal — standard VCA-style implementation.
+    Uses a fast envelope follower (numba if installed, otherwise a
+    vectorised frame-based approximation) so multi-minute tracks no
+    longer spend most of their runtime in a pure-Python sample loop.
+    Soft-knee gain computation remains fully vectorised either way.
     """
     if not CAP.numpy:
         return audio
@@ -619,51 +717,28 @@ def compress(
 
     n_samples = len(audio)
     channels = audio.shape[1] if audio.ndim == 2 else 1
-
-    # Per-channel processing, then recombine
     out = np.empty_like(audio)
+    half_knee = knee_db / 2.0
+    inv_ratio_m1 = (1.0 / ratio - 1.0)
+    eps = 1e-12
 
     for ch in range(channels):
         x = audio[:, ch] if channels > 1 else audio.ravel()
-
-        # Compute instantaneous level (simple square-law detector)
-        level_sq = x ** 2
-
-        # Smooth level estimate with separate attack/release EMA
-        tau_att = math.exp(-1.0 / (sr * attack_ms  / 1000.0))
-        tau_rel = math.exp(-1.0 / (sr * release_ms / 1000.0))
-
-        level_smooth = np.empty(n_samples, dtype=np.float32)
-        lvl = 0.0
-        for i in range(n_samples):
-            target = float(level_sq[i])
-            coef = tau_att if target > lvl else tau_rel
-            lvl = coef * lvl + (1.0 - coef) * target
-            level_smooth[i] = lvl
-
-        # Convert to dB (level is mean-square, so divide by 2 in log)
-        eps = 1e-12
+        level_sq = (x.astype(np.float64) ** 2).astype(np.float32)
+        level_smooth = _ema_envelope_fast(level_sq, sr, attack_ms, release_ms)
         level_db = 10.0 * np.log10(np.maximum(level_smooth, eps))
 
-        # Soft-knee gain reduction
         above = level_db - threshold_db
-        half_knee = knee_db / 2.0
-
-        # Region below knee: no gain reduction
-        # Region within knee: quadratic interpolation
-        # Region above knee: full ratio gain reduction
         gr_db = np.where(
             above <= -half_knee,
             0.0,
             np.where(
                 above < half_knee,
-                (1.0 / ratio - 1.0) * (above + half_knee) ** 2 / (2.0 * knee_db),
-                (1.0 / ratio - 1.0) * above,
+                inv_ratio_m1 * (above + half_knee) ** 2 / (2.0 * knee_db),
+                inv_ratio_m1 * above,
             ),
         )
-
-        gain_linear = 10.0 ** (gr_db / 20.0)
-
+        gain_linear = (10.0 ** (gr_db / 20.0)).astype(np.float32)
         y = x * gain_linear
         if channels > 1:
             out[:, ch] = y
@@ -825,16 +900,13 @@ def apply_brickwall_limiter(
     if audio.ndim == 2:
         abs_peak = abs_peak.max(axis=1)
 
-    tau_att = math.exp(-1.0 / (sr * attack_ms  / 1000.0))
-    tau_rel = math.exp(-1.0 / (sr * release_ms / 1000.0))
-
-    envelope = np.empty(len(audio), dtype=np.float32)
-    env = 0.0
-    for i in range(len(abs_peak)):
-        target = float(abs_peak[i])
-        coef = tau_att if target > env else tau_rel
-        env = coef * env + (1.0 - coef) * target
-        envelope[i] = max(env, 1e-12)
+    # Re-use the fast dual-tau envelope (peak detector: feed |x|^2-like
+    # by squaring peak so the follower semantics match compress()).
+    envelope = _ema_envelope_fast(
+        (abs_peak.astype(np.float64) ** 2).astype(np.float32),
+        sr, attack_ms, release_ms,
+    )
+    envelope = np.sqrt(np.maximum(envelope, 1e-24)).astype(np.float32)
 
     gain = np.minimum(1.0, ceiling / envelope).astype(np.float32)
     if audio.ndim == 2:
@@ -912,7 +984,7 @@ def measure_lufs(audio: "np.ndarray", sr: int) -> float:
 
     Note: pyloudnorm requires at least ~0.4 seconds of audio for the
     gating algorithm to produce a meaningful result. For shorter clips
-    (e.g. preview segments), use measure_lufs_peak() instead.
+    (e.g. preview segments) the RMS approximation path is used instead.
     """
     if not CAP.numpy:
         return -23.0  # safe default
@@ -1095,8 +1167,12 @@ def _cache_path(key: str) -> Path:
 
 def _load_stem_cache(
     path: Path, model: str
-) -> dict[str, "np.ndarray"] | None:
-    """Return cached stems dict {name: float32 array} or None on miss."""
+) -> tuple[dict[str, "np.ndarray"], int] | None:
+    """Return (stems dict, sample_rate) or None on miss.
+
+    Older cache files without a sample_rate entry are treated as 44100
+    (Demucs default) so they remain usable.
+    """
     if not CAP.numpy:
         return None
     key   = _stem_cache_key(path, model)
@@ -1106,21 +1182,33 @@ def _load_stem_cache(
     try:
         data = np.load(cpath, allow_pickle=False)
         log.debug("Stem cache hit: %s", cpath.name)
-        return {k: data[k] for k in data.files}
+        sr = 44100
+        stems: dict[str, np.ndarray] = {}
+        for k in data.files:
+            if k == "_sample_rate":
+                sr = int(data[k])
+            else:
+                stems[k] = data[k]
+        if not stems:
+            return None
+        return stems, sr
     except Exception as exc:
         log.debug("Stem cache load failed: %s", exc)
         return None
 
 
 def _save_stem_cache(
-    path: Path, model: str, stems: dict[str, "np.ndarray"]
+    path: Path, model: str, stems: dict[str, "np.ndarray"], sample_rate: int = 44100
 ) -> None:
     if not CAP.numpy:
         return
     key   = _stem_cache_key(path, model)
     cpath = _cache_path(key)
     try:
-        np.savez(cpath, **stems)
+        # Store sample rate as a 0-d scalar array so older loaders that
+        # only expected stem arrays still open the file (they will just
+        # ignore the extra key).
+        np.savez(cpath, _sample_rate=np.array(sample_rate, dtype=np.int32), **stems)
         log.debug("Stem cache saved: %s", cpath.name)
     except Exception as exc:
         log.debug("Stem cache save failed: %s", exc)
@@ -1133,10 +1221,12 @@ def separate_stems(
     model: str = "htdemucs",
     device: str = "cpu",
     use_cache: bool = True,
-) -> dict[str, "np.ndarray"] | None:
+) -> tuple[dict[str, "np.ndarray"], int] | None:
     """Separate a track into stems using Demucs (Python API).
-    Returns {stem_name: float32 array (samples, channels)} at 44100Hz,
-    or None if Demucs is unavailable.
+
+    Returns ({stem_name: float32 array (samples, channels)}, sample_rate)
+    where sample_rate is the Demucs model rate (typically 44100), or None
+    if Demucs is unavailable / separation fails.
 
     Uses the SHA-free fast-path cache (mtime+size+model+version).
     """
@@ -1144,10 +1234,15 @@ def separate_stems(
         log.warning("Demucs not available — stem separation skipped.")
         return None
 
+    if not model or model == "none":
+        log.info("Stem model set to none — skipping separation.")
+        return None
+
     if use_cache:
         cached = _load_stem_cache(input_path, model)
         if cached is not None:
-            return cached
+            stems, cached_sr = cached
+            return stems, cached_sr
 
     try:
         import torch
@@ -1159,11 +1254,12 @@ def separate_stems(
         demucs_model = get_model(model)
         demucs_model.to(device)
         demucs_model.eval()
+        model_sr = int(demucs_model.samplerate)
 
-        log.info("Separating: %s", input_path.name)
+        log.info("Separating: %s (model SR=%d)", input_path.name, model_sr)
         wav = AudioFile(str(input_path)).read(
             streams=0,
-            samplerate=demucs_model.samplerate,
+            samplerate=model_sr,
             channels=demucs_model.audio_channels,
         )
         ref = wav.mean(0)
@@ -1182,9 +1278,9 @@ def separate_stems(
             stems[name] = s.T.astype(np.float32)  # (samples, channels)
 
         if use_cache:
-            _save_stem_cache(input_path, model, stems)
+            _save_stem_cache(input_path, model, stems, model_sr)
 
-        return stems
+        return stems, model_sr
 
     except Exception as exc:
         log.warning("Demucs separation failed: %s — proceeding without stems.", exc)
@@ -1288,6 +1384,81 @@ def _apply_voicefixer_mid_only(
 
 
 # --- Instrument chain ---
+
+
+def _apply_deepfilternet(
+    audio: "np.ndarray",
+    sr: int,
+) -> "np.ndarray":
+    """Run DeepFilterNet denoise on the full mix (experimental).
+
+    DeepFilterNet is speech-oriented; on music it can suppress
+    instruments it misclassifies as noise. Only called when the user
+    explicitly enables it (and acknowledges the risk in the wizard).
+
+    Processes channel-wise at the model's internal rate, then resamples
+    back to `sr`. Falls back to the input on any error.
+    """
+    if not CAP.numpy or not CAP.deepfilternet:
+        return audio
+    try:
+        import torch
+        from df.enhance import enhance, init_df
+        from df.io import resample as df_resample
+
+        model, df_state, _ = init_df(log_level="ERROR")
+        model_sr = df_state.sr()
+
+        # Work mono mid to avoid phase issues across channels, then
+        # re-apply original side signal (same approach as VoiceFixer).
+        channels = audio.shape[1] if audio.ndim == 2 else 1
+        if channels == 1:
+            mid = audio.ravel().astype(np.float32)
+            side = None
+        else:
+            mid = ((audio[:, 0] + audio[:, 1]) * 0.5).astype(np.float32)
+            side = ((audio[:, 0] - audio[:, 1]) * 0.5).astype(np.float32)
+
+        # DeepFilterNet expects shape (channels, samples) tensor at model_sr
+        if sr != model_sr:
+            # Simple linear resample for the mid channel
+            n_out = int(round(len(mid) * model_sr / sr))
+            xp = np.linspace(0, 1, len(mid), endpoint=False)
+            xq = np.linspace(0, 1, n_out, endpoint=False)
+            mid_rs = np.interp(xq, xp, mid).astype(np.float32)
+        else:
+            mid_rs = mid
+
+        tensor = torch.from_numpy(mid_rs).unsqueeze(0)  # (1, samples)
+        with torch.no_grad():
+            enhanced = enhance(model, df_state, tensor)
+        mid_out = enhanced.squeeze(0).cpu().numpy().astype(np.float32)
+
+        if sr != model_sr:
+            n_back = len(mid)
+            xp = np.linspace(0, 1, len(mid_out), endpoint=False)
+            xq = np.linspace(0, 1, n_back, endpoint=False)
+            mid_out = np.interp(xq, xp, mid_out).astype(np.float32)
+            # Match length exactly
+            if len(mid_out) > n_back:
+                mid_out = mid_out[:n_back]
+            elif len(mid_out) < n_back:
+                mid_out = np.pad(mid_out, (0, n_back - len(mid_out)))
+
+        if side is None:
+            return mid_out.reshape(-1, 1)
+
+        # Truncate side to match if needed
+        n = min(len(mid_out), len(side))
+        mid_out, side = mid_out[:n], side[:n]
+        L = mid_out + side
+        R = mid_out - side
+        return np.stack([L, R], axis=1).astype(np.float32)
+
+    except Exception as exc:
+        log.warning("DeepFilterNet failed: %s — skipping.", exc)
+        return audio
+
 
 def process_instrument_stems(
     stems: dict[str, "np.ndarray"],
@@ -1800,17 +1971,29 @@ def detect_content_type(
     """
     scores: dict[ContentKey, float] = {k: 0.0 for k in CONTENT_PROFILES}
 
+    # `max_possible` tracks how much evidence we actually had a chance to
+    # gather this run (which signal groups were evaluated), independent of
+    # whether any of them actually matched anything. Confidence is then
+    # scores[best] / max_possible rather than scores[best] / sum(scores) —
+    # the latter would let a single weak signal (e.g. one filename keyword
+    # match, worth 0.25) report 100% confidence just because it was the
+    # only thing that fired, even though most of the available evidence
+    # (spectral analysis, tag year) never got a chance to weigh in.
+    max_possible = 0.0
+
     # --- Tag / filename signals (40% total weight) ---
     tag_year: int = 0
 
     if file_path is not None:
         # Filename keyword scan
+        max_possible += 0.25
         fname_hint = content_hint_from_filename(file_path.name)
         if fname_hint:
             scores[fname_hint] += 0.25
 
         # ID3 year tag
         if CAP.mutagen:
+            max_possible += 0.15
             try:
                 from mutagen import File as MutagenFile
                 tags = MutagenFile(str(file_path), easy=True)
@@ -1828,6 +2011,7 @@ def detect_content_type(
 
     # --- Spectral signals (60% total weight) ---
     if audio is not None and CAP.numpy:
+        max_possible += 0.60
         n = len(audio)
         mono = audio.mean(axis=1) if audio.ndim == 2 else audio.ravel()
 
@@ -1895,13 +2079,23 @@ def detect_content_type(
             scores["modern_mastered"] += 0.05
             scores["bgm"] += 0.05
 
-    # Normalise and find winner
-    total = sum(scores.values())
-    if total < 1e-6:
+    # Normalise against the evidence we had a chance to gather (see
+    # max_possible above), not just the evidence that happened to fire —
+    # otherwise one lone weak signal can misreport as 100% confident.
+    if max_possible < 1e-6:
         return "early_digital", 0.4  # safe default — moderate processing, safest guess
 
     best_key = max(scores, key=lambda k: scores[k])
-    confidence = scores[best_key] / total
+    confidence = min(1.0, scores[best_key] / max_possible)
+
+    # Extra floor: spectral analysis (60% of the total weight) is by far
+    # the most reliable signal — filename/tag hints alone are thin
+    # evidence. If spectral analysis never ran at all (no audio available,
+    # e.g. numpy missing or nothing loaded yet), cap confidence so a lone
+    # filename keyword match can't still report as "auto-detected" green.
+    spectral_ran = audio is not None and CAP.numpy
+    if not spectral_ran:
+        confidence = min(confidence, 0.5)
 
     log.debug(
         "Content detection: %s (confidence %.0f%%)\n  scores: %s",
@@ -1916,6 +2110,279 @@ def detect_content_type(
 
 _playback_stop_event = threading.Event()
 _playback_thread: threading.Thread | None = None
+
+
+def _stereo_width_ratio(audio: "np.ndarray") -> float:
+    """Side/mid RMS energy ratio: 0 = mono, ~1+ = very wide. Direct numpy
+    port of the original pydub-based _compute_stereo_width_ratio (which
+    looped sample-by-sample) — same definition, vectorised.
+    """
+    if not CAP.numpy or audio.ndim < 2 or audio.shape[1] < 2:
+        return 0.0
+    L, R = audio[:, 0].astype(np.float64), audio[:, 1].astype(np.float64)
+    mid  = (L + R) * 0.5
+    side = (L - R) * 0.5
+    mid_rms  = float(np.sqrt(np.mean(mid ** 2)))
+    side_rms = float(np.sqrt(np.mean(side ** 2)))
+    return side_rms / mid_rms if mid_rms > 1e-9 else 0.0
+
+
+def _windowed_dbfs(signal: "np.ndarray", sr: int, window_s: float = 1.0) -> list[float]:
+    """Split a mono signal into fixed windows and return each window's
+    RMS level in dBFS, skipping windows that are effectively silent.
+    Shared by noise-floor estimation and (in elaborate mode) the
+    bass/mid/treble measurements, so both get a robust, full-track
+    distribution instead of one aggregate number that a loud intro or a
+    silent outro can skew.
+    """
+    window = max(1, int(sr * window_s))
+    out: list[float] = []
+    for start in range(0, len(signal), window):
+        chunk = signal[start:start + window]
+        if len(chunk) > 100:
+            rms = float(np.sqrt(np.mean(chunk ** 2)))
+            if rms > 1e-9:
+                out.append(20.0 * math.log10(rms))
+    return out
+
+
+def analyze_track_for_optimal_params(
+    audio: "np.ndarray",
+    sr: int,
+    input_path: "Path | None" = None,
+    use_demucs: bool = False,
+    demucs_model: str = "htdemucs",
+    music_lufs_reference: float = -18.0,
+    elaborate: bool = False,
+) -> dict:
+    """Analyze one specific track's actual characteristics and recommend
+    concrete parameter values tuned to THIS recording, rather than the
+    device/content profile's category-wide defaults.
+
+    This is a numpy/current-engine port of the analyze_track() /
+    compute_recommendations() pair from the project's earlier CLI+GUI
+    tool (remaster_ilayaraja.py / remaster_gui.py) — same measurements,
+    same discrete recommendation thresholds — adapted to this codebase's
+    float32/numpy pipeline and current parameter names. Two differences
+    from that port, both noted inline below:
+      - dBFS here is measured directly off full-scale float32 (peak=1.0),
+        matching pydub's .dBFS/.max_dBFS semantics the original used.
+      - "vocal-gain-db" was a relative trim on top of a separated vocal
+        stem in the old tool; this engine's vocal chain instead targets
+        an absolute vocal_lufs level, so the recommendation is expressed
+        as a suggested vocal_lufs relative to the current music_lufs
+        target rather than as an additive gain (see below).
+
+    `elaborate=True` trades speed for thoroughness. The default (fast)
+    path measures each band as one aggregate RMS over (at most) the first
+    120 seconds the caller passed in — quick, but a loud intro or a long
+    quiet outro can skew a single aggregate number, and there's no full
+    picture of how consistent the track is across its length. Elaborate
+    mode, given the FULL track's audio:
+      - measures bass/mid/treble as the MEDIAN of 1-second windowed
+        levels across the whole track (robust to intro/outro/one-off
+        transients) instead of one aggregate RMS, and also reports each
+        band's window-to-window spread so you can see how consistent the
+        tonal balance actually is, not just its central tendency;
+      - adds integrated LUFS (BS.1770, via pyloudnorm) and an approximate
+        loudness range (spread of windowed short-term loudness) — proper
+        broadcast-style loudness measures rather than a plain RMS dBFS
+        average;
+      - always attempts the Demucs vocal/instrument comparison (if Demucs
+        is installed) instead of only when a stem model happens to be
+        selected for export, since that's the single biggest driver of
+        analysis time and worth spending regardless of the export choice.
+    The recommendation thresholds themselves are unchanged between modes
+    — elaborate mode feeds them more reliable inputs, it doesn't use a
+    different decision table.
+
+    Returns:
+      {
+        "measurements":   {raw measured values, for display},
+        "recommendations": {param_name: value, ...},  # "ideal" values
+      }
+    """
+    if not CAP.numpy:
+        return {"measurements": {}, "recommendations": {}}
+
+    n = len(audio)
+    if n == 0:
+        return {"measurements": {}, "recommendations": {}}
+
+    measurements: dict[str, Any] = {}
+    rec: dict[str, Any] = {}
+    measurements["elaborate"] = elaborate
+    measurements["analyzed_duration_s"] = round(n / sr, 1)
+
+    mono = audio.mean(axis=1) if audio.ndim == 2 else audio.ravel()
+
+    # --- Peak / RMS / crest factor, in dBFS (full scale = 1.0) ---
+    peak_dbfs = 20.0 * math.log10(float(np.max(np.abs(mono))) + 1e-12)
+    rms_dbfs  = 20.0 * math.log10(float(np.sqrt(np.mean(mono ** 2))) + 1e-12)
+    crest_factor_db = peak_dbfs - rms_dbfs
+    measurements["peak_dbfs"] = round(peak_dbfs, 1)
+    measurements["rms_dbfs"] = round(rms_dbfs, 1)
+    measurements["crest_factor_db"] = round(crest_factor_db, 1)
+
+    if elaborate:
+        # Proper broadcast-style loudness measures, full track.
+        measurements["integrated_lufs"] = round(measure_lufs(audio, sr), 1)
+        overall_windows = _windowed_dbfs(mono, sr, window_s=3.0)
+        if len(overall_windows) >= 2:
+            arr = np.array(overall_windows)
+            # 95th-5th percentile spread as an approximate loudness range
+            # (LRA) — cheap, no gating algorithm, but a reasonable proxy
+            # for "how much does this track's level vary over its length".
+            lra_approx = float(np.percentile(arr, 95) - np.percentile(arr, 5))
+            measurements["loudness_range_approx_db"] = round(lra_approx, 1)
+
+    # --- Bass / Mid / Treble split, compared against MID (not the full
+    # mix) — this is what the original design compares against, and it's
+    # a better tonal-balance signal than comparing against the full mix,
+    # since the full mix already blends bass+mid+treble together. ---
+    if CAP.scipy:
+        bass  = lr_lowpass(mono.reshape(-1, 1), sr, 150.0).ravel()
+        treble = lr_highpass(mono.reshape(-1, 1), sr, 6000.0).ravel()
+        mid = lr_lowpass(lr_highpass(mono.reshape(-1, 1), sr, 150.0), sr, 6000.0).ravel()
+
+        if elaborate:
+            # Median of windowed levels across the FULL track, not one
+            # aggregate RMS — see docstring. Falls back to the aggregate
+            # if a band is too quiet throughout to produce any windows.
+            bass_windows   = _windowed_dbfs(bass, sr)
+            mid_windows    = _windowed_dbfs(mid, sr)
+            treble_windows = _windowed_dbfs(treble, sr)
+            bass_dbfs = float(np.median(bass_windows)) if bass_windows else \
+                20.0 * math.log10(float(np.sqrt(np.mean(bass ** 2))) + 1e-12)
+            mid_dbfs = float(np.median(mid_windows)) if mid_windows else \
+                20.0 * math.log10(float(np.sqrt(np.mean(mid ** 2))) + 1e-12)
+            treble_dbfs = float(np.median(treble_windows)) if treble_windows else \
+                20.0 * math.log10(float(np.sqrt(np.mean(treble ** 2))) + 1e-12)
+            if bass_windows:
+                measurements["bass_variability_db"] = round(
+                    float(np.percentile(bass_windows, 90) - np.percentile(bass_windows, 10)), 1)
+            if treble_windows:
+                measurements["treble_variability_db"] = round(
+                    float(np.percentile(treble_windows, 90) - np.percentile(treble_windows, 10)), 1)
+        else:
+            bass_dbfs   = 20.0 * math.log10(float(np.sqrt(np.mean(bass ** 2))) + 1e-12)
+            mid_dbfs    = 20.0 * math.log10(float(np.sqrt(np.mean(mid ** 2))) + 1e-12)
+            treble_dbfs = 20.0 * math.log10(float(np.sqrt(np.mean(treble ** 2))) + 1e-12)
+
+        measurements["bass_dbfs"] = round(bass_dbfs, 1)
+        measurements["mid_dbfs"] = round(mid_dbfs, 1)
+        measurements["treble_dbfs"] = round(treble_dbfs, 1)
+
+        bass_vs_mid = bass_dbfs - mid_dbfs
+        if bass_vs_mid < -6:
+            rec["bass_shelf_db"] = 4.0
+        elif bass_vs_mid > 0:
+            rec["bass_shelf_db"] = 1.0
+        else:
+            rec["bass_shelf_db"] = 2.5
+
+        treble_vs_mid = treble_dbfs - mid_dbfs
+        if treble_vs_mid < -10:
+            rec["treble_shelf_db"] = 3.0
+        elif treble_vs_mid > -4:
+            rec["treble_shelf_db"] = 1.0
+        else:
+            rec["treble_shelf_db"] = 2.0
+
+    # --- Stereo width ratio -> per-band width suggestion ---
+    # The original kept bass centred/mono automatically and only widened
+    # everything above it; this engine's per-band width control mirrors
+    # that split via width_bass (left at 1.0, unchanged) + width_mid/
+    # width_treble (the two this recommendation actually sets).
+    if audio.ndim == 2 and audio.shape[1] >= 2:
+        width_ratio = _stereo_width_ratio(audio)
+        measurements["stereo_width_ratio"] = round(width_ratio, 2)
+        if width_ratio < 0.15:
+            suggested_width = 3.0
+        elif width_ratio > 0.5:
+            suggested_width = 1.7
+        else:
+            suggested_width = 2.2
+        rec["width_mid"] = suggested_width
+        rec["width_treble"] = suggested_width
+
+    # --- Auto loudness ---
+    rec["auto_loudness"] = crest_factor_db > 8
+
+    # --- Loudness headroom ---
+    # The original always recommended 0.4dB regardless of the track (a
+    # flat, safe default) and printed the source's own raw peak headroom
+    # alongside it for context — preserved as-is here rather than
+    # inventing a track-dependent formula that didn't exist originally.
+    rec["headroom_db"] = 0.4
+    measurements["raw_peak_headroom_db"] = round(abs(peak_dbfs), 1)
+
+    # --- Noise floor -> denoise / denoise amount ---
+    window_dbfs = _windowed_dbfs(mono, sr, window_s=1.0)
+    if window_dbfs:
+        window_dbfs_sorted = sorted(window_dbfs)
+        quietest = window_dbfs_sorted[: max(1, len(window_dbfs_sorted) // 20)]
+        noise_floor_dbfs = sum(quietest) / len(quietest)
+        measurements["noise_floor_dbfs"] = round(noise_floor_dbfs, 1)
+        rec["denoise"] = noise_floor_dbfs > -50
+        rec["denoise_amount"] = 12.0 if noise_floor_dbfs > -50 else 8.0
+
+    # --- Vocal vs instrumental level (optional, needs Demucs) ---
+    # Only run when explicitly requested — separation is the slowest part
+    # of analysis by far, same as the original tool's --use-demucs gate.
+    # Elaborate mode always attempts it (if Demucs is installed) since
+    # it's the single biggest lever for spending more time on a more
+    # thorough result, regardless of what was picked for export.
+    # `vocal_analysis_status` is always set (never silently omitted) so
+    # the caller can tell the difference between "ran and found nothing
+    # unusual" and "never ran" — and if it never ran, why not. Without
+    # this, a skipped Demucs step looks identical to a fast, successful
+    # analysis: no vocal_lufs recommendation and no indication why.
+    if not (use_demucs or elaborate):
+        measurements["vocal_analysis_status"] = "skipped (no stem model selected in Step 4)"
+    elif not CAP.demucs:
+        measurements["vocal_analysis_status"] = "skipped (Demucs not installed)"
+    elif input_path is None:
+        measurements["vocal_analysis_status"] = "skipped (no input file path)"
+    else:
+        try:
+            result = separate_stems(Path(input_path), model=demucs_model, use_cache=True)
+            if result is None:
+                measurements["vocal_analysis_status"] = "skipped (Demucs separation returned no stems)"
+            else:
+                stems, stem_sr = result
+                if "vocals" not in stems:
+                    measurements["vocal_analysis_status"] = "skipped (no vocal stem in Demucs output)"
+                else:
+                    vocals = stems["vocals"]
+                    instrument_names = [k for k in stems if k != "vocals"]
+                    if not instrument_names:
+                        measurements["vocal_analysis_status"] = "skipped (no instrument stems to compare against)"
+                    else:
+                        inst_mix = stems[instrument_names[0]].copy()
+                        for k in instrument_names[1:]:
+                            n_min = min(len(inst_mix), len(stems[k]))
+                            inst_mix = inst_mix[:n_min] + stems[k][:n_min]
+                        vocal_mono = vocals.mean(axis=1) if vocals.ndim == 2 else vocals.ravel()
+                        inst_mono  = inst_mix.mean(axis=1) if inst_mix.ndim == 2 else inst_mix.ravel()
+                        vocal_dbfs = 20.0 * math.log10(float(np.sqrt(np.mean(vocal_mono ** 2))) + 1e-12)
+                        inst_dbfs  = 20.0 * math.log10(float(np.sqrt(np.mean(inst_mono ** 2))) + 1e-12)
+                        ratio_db = vocal_dbfs - inst_dbfs
+                        measurements["vocal_instrument_ratio_db"] = round(ratio_db, 1)
+                        measurements["vocal_analysis_status"] = "ok"
+                        # Original: suggested additive gain = -(ratio + 6.0), aiming
+                        # for vocals sitting 6dB below the instrumental. Ported here
+                        # as an absolute vocal_lufs target relative to the current
+                        # music_lufs reference, since this engine targets vocal_lufs
+                        # directly rather than applying a relative gain on top of
+                        # whatever the vocal happened to measure at.
+                        target_relative_db = -(ratio_db + 6.0)
+                        rec["vocal_lufs"] = round(music_lufs_reference + target_relative_db, 1)
+        except Exception as exc:
+            log.warning("Demucs analysis for vocal/instrument ratio failed: %s", exc)
+            measurements["vocal_analysis_status"] = f"failed ({exc})"
+
+    return {"measurements": measurements, "recommendations": rec}
 
 
 def play_audio_preview(
@@ -2351,6 +2818,19 @@ def remaster_file(
 
         audio, sr = pydub_to_float32(seg)
 
+        # Optional preview window (CLI --preview-seconds / --preview-start)
+        preview_seconds = float(params.get("preview_seconds", 0) or 0)
+        preview_start = float(params.get("preview_start", 0.0) or 0.0)
+        if preview_seconds > 0:
+            start_samp = max(0, int(preview_start * sr))
+            end_samp = min(len(audio), start_samp + int(preview_seconds * sr))
+            if end_samp > start_samp:
+                audio = audio[start_samp:end_samp]
+                log.info(
+                    "Preview mode: %.1fs starting at %.1fs (%d samples)",
+                    preview_seconds, preview_start, len(audio),
+                )
+
         # Trim silence and fades
         if params.get("trim_silence", False):
             audio = trim_track_silence(
@@ -2360,58 +2840,105 @@ def remaster_file(
                 keep_silence_ms=params.get("keep_silence_ms", 150),
             )
 
+        # Experimental DeepFilterNet denoise (full-mix, pre-stems)
+        if params.get("use_deepfilternet", False) and CAP.deepfilternet:
+            _progress("deepfilternet", 12)
+            try:
+                audio = _apply_deepfilternet(audio, sr)
+                log.info("DeepFilterNet applied.")
+            except Exception as exc:
+                log.warning("DeepFilterNet failed: %s — continuing without it.", exc)
+
         _progress("stems", 15)
 
         # Stem separation (Demucs)
         vocal_stem: np.ndarray | None = None
         instrument_mix: np.ndarray | None = None
+        stems_used = False
 
-        if params.get("use_stems", False) and params.get("use_demucs", False):
-            model = params.get("demucs_model", "htdemucs")
-            stems = separate_stems(
-                input_path, model=model,
+        model = params.get("demucs_model", "htdemucs")
+        want_stems = (
+            params.get("use_stems", False)
+            and params.get("use_demucs", False)
+            and model
+            and model != "none"
+        )
+        if want_stems:
+            # Prefer the restored file so declick/denoise is not discarded
+            # when stem separation is active.
+            stem_source = actual_path if actual_path != input_path else input_path
+            result = separate_stems(
+                stem_source, model=model,
                 use_cache=params.get("use_cache", True),
             )
-            if stems is not None and "vocals" in stems:
-                # Vocal chain
-                vocal_stem = process_vocal_stem(
-                    stems["vocals"], sr,
-                    presence_db=params.get("vocal_presence_db", 1.5),
-                    air_db=params.get("vocal_air_db", 2.0),
-                    mud_cut_db=params.get("vocal_mud_cut_db", -1.5),
-                    deesser=params.get("deesser", False),
-                    deesser_threshold_db=params.get("deesser_threshold_db", -24.0),
-                    deesser_ratio=params.get("deesser_ratio", 4.0),
-                    deesser_freq=params.get("deesser_freq", 5000),
-                    target_lufs=params.get("vocal_lufs", -18.0),
-                    headroom_db=params.get("headroom_db", 0.5),
-                    use_voicefixer=params.get("use_voicefixer", False),
-                )
-                # Instrument chain (all non-vocal stems)
-                inst_stems = {k: v for k, v in stems.items() if k != "vocals"}
-                if inst_stems:
-                    instrument_mix = process_instrument_stems(
-                        inst_stems, sr,
-                        bass_shelf_db=params.get("inst_bass_shelf_db", 1.0),
-                        air_shelf_db=params.get("inst_air_shelf_db", 1.5),
-                        harmonic_exciter=params.get("inst_harmonic_exciter", True),
-                        exciter_freq=params.get("inst_exciter_freq", 3000),
-                        exciter_amount=params.get("inst_exciter_amount", 0.25),
-                        target_lufs=params.get("music_lufs", -18.0),
+            if result is not None:
+                stems, stem_sr = result
+                if "vocals" in stems:
+                    # Demucs always outputs at its model sample rate
+                    # (typically 44100). Resample stems back to the
+                    # source rate so the rest of the pipeline keeps the
+                    # original timeline, filter tuning, and export rate.
+                    source_sr = sr
+                    if stem_sr != source_sr:
+                        log.info(
+                            "Resampling stems %d Hz → source rate %d Hz.",
+                            stem_sr, source_sr,
+                        )
+                        stems = {
+                            k: resample_audio(v, stem_sr, source_sr)
+                            for k, v in stems.items()
+                        }
+
+                    # Align all stem lengths before processing
+                    min_len = min(len(s) for s in stems.values())
+                    stems = {k: v[:min_len] for k, v in stems.items()}
+
+                    # Vocal chain
+                    vocal_stem = process_vocal_stem(
+                        stems["vocals"], sr,
+                        presence_db=params.get("vocal_presence_db", 1.5),
+                        air_db=params.get("vocal_air_db", 2.0),
+                        mud_cut_db=params.get("vocal_mud_cut_db", -1.5),
+                        deesser=params.get("deesser", False),
+                        deesser_threshold_db=params.get("deesser_threshold_db", -24.0),
+                        deesser_ratio=params.get("deesser_ratio", 4.0),
+                        deesser_freq=params.get("deesser_freq", 5000),
+                        target_lufs=params.get("vocal_lufs", -18.0),
                         headroom_db=params.get("headroom_db", 0.5),
+                        use_voicefixer=params.get("use_voicefixer", False),
                     )
-                # Recombine for mastering (without the raw stem pre-normalisation bug)
-                components = [vocal_stem]
-                if instrument_mix is not None:
-                    components.append(instrument_mix)
-                audio = sum(components).astype(np.float32)
-                # Ensure length matches original (stems may differ by a few samples)
-                n = min(len(audio), len(components[0]))
-                audio = audio[:n]
+                    # Instrument chain (all non-vocal stems)
+                    inst_stems = {k: v for k, v in stems.items() if k != "vocals"}
+                    if inst_stems:
+                        instrument_mix = process_instrument_stems(
+                            inst_stems, sr,
+                            bass_shelf_db=params.get("inst_bass_shelf_db", 1.0),
+                            air_shelf_db=params.get("inst_air_shelf_db", 1.5),
+                            harmonic_exciter=params.get("inst_harmonic_exciter", True),
+                            exciter_freq=params.get("inst_exciter_freq", 3000),
+                            exciter_amount=params.get("inst_exciter_amount", 0.25),
+                            target_lufs=params.get("music_lufs", -18.0),
+                            headroom_db=params.get("headroom_db", 0.5),
+                        )
+                    # Recombine for mastering — align component lengths first
+                    components = [vocal_stem]
+                    if instrument_mix is not None:
+                        components.append(instrument_mix)
+                    min_comp = min(len(c) for c in components)
+                    components = [c[:min_comp] for c in components]
+                    audio = sum(components).astype(np.float32)
+                    stems_used = True
 
         _progress("mastering", 40)
 
         # Mastering chain
+        # When stems were used, vocal_presence_db was already applied in the
+        # vocal chain — strip it from the master presence peak to avoid a
+        # double boost on the vocal region.
+        master_presence_db = params.get("presence_db", 0.0)
+        if stems_used:
+            master_presence_db = master_presence_db - params.get("vocal_presence_db", 0.0)
+
         audio = apply_mastering_chain(
             audio, sr,
             bass_shelf_hz=params.get("bass_shelf_hz", 100.0),
@@ -2419,7 +2946,7 @@ def remaster_file(
             treble_shelf_hz=params.get("treble_shelf_hz", 8000.0),
             treble_shelf_db=params.get("treble_shelf_db", 0.0),
             presence_hz=params.get("presence_hz", 0.0),
-            presence_db=params.get("presence_db", 0.0),
+            presence_db=master_presence_db,
             presence_q=params.get("presence_q", 1.2),
             notch_hz=params.get("notch_hz", 0.0),
             notch_db=params.get("notch_db", 0.0),
@@ -2942,6 +3469,9 @@ def _apply_cli_overrides(params: dict, args: argparse.Namespace) -> dict:
     p["limiter_oversample"] = args.limiter_oversample
     p["use_loudnorm"] = True
     p.setdefault("lufs_range", 11.0)
+    # Preview window (0 duration = full file)
+    p["preview_seconds"] = getattr(args, "preview_seconds", 0) or 0
+    p["preview_start"] = getattr(args, "preview_start", 0.0) or 0.0
     return p
 
 

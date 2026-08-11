@@ -13,7 +13,9 @@ Run with:
 
 from __future__ import annotations
 
+import base64
 import json
+import logging
 import math
 import queue
 import threading
@@ -39,6 +41,191 @@ from content_profiles import CONTENT_PROFILES
 from profile_resolver import resolve_profile
 
 CONFIG_PATH = Path.home() / ".openremaster" / "config.json"
+
+# Base64-encoded PNG data for a small flat cassette-tape icon, used as
+# the window/title-bar/taskbar icon (see _set_app_icon() in main()).
+# Generated once from a vector-style PIL drawing; no external asset file
+# is needed at runtime, so a copy of this script is always self-contained.
+_APP_ICON_PNG_B64: dict[int, str] = {
+    16: (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAACyUlEQVR4nG2STYiVZRTHf+d5n/fzvt4ZxjtRJkwwUEGS0WJw"
+        "4Ubb9LFyFgO2SZCRgkpiIFAos0VloW40ykXQB9FC26hBSAXlzGAYQTBJq0KHcUZvyPXe6/143+c5Le40TeV/eZ5z/ufP7zzC"
+        "qk6o5gpxAtoF4S76+02g96JIC0BA2PbCmefrC+cP3FpZjFSMEfyagQ6aMMYAouqdH65tLka3PHlk/oOpk3JEdcOH25/7o9b5"
+        "ZWRyaooAYS2AQCCCorQ6Dq9KGArnvjzNjeiRxr65T8dsAHGjvlxO79mtz778ql64VJcsjVAFRbndLknjgL3bhgmA3KIikRz/"
+        "5OuiA7GNQVVEksjKUh0u/7Yi1TyhdJ40Ctj56ChZbHEFlB5yC9YGghiJQG0TSOOE2dlZ7nlwglHXIL4jOBXCQtD6Tfo24PLV"
+        "AuchToRL87MkUUyrCfbKFcjznG+/Ocv3P8xB0aZTWgwFWRrT7jpad7pgQmJTkmRVxHeobXmG5WUwAKpKllUoipKxiUneP/0d"
+        "04c+okuOTavMvPMxn52/yGM7dyM4sqyCqgJgB7QFV/QIq5s4/PYxFpb6PLVrKyuLv+NKx9OTU/y4cJ3X3zrKnl0/UTavImLW"
+        "Gay7uIjgvIKCiEGMogreKyL//18DA1UkiOk3ljh8cIb9M69w4ew85z4/garn/rFxHt/6MG8ePETv1iJZEqPq/51A1ZOkGb9e"
+        "PMPeua8Q36eSxgCcfGMfaiKs75DlQ6jv/ZOgNAh49d7r0MaNOjxSo9n4ExPkeD/YMpJW8K5gw9AmvKKNG9dAVQuD2M0P0fs5"
+        "ykMtu+L7bfGqFN02QRDAKmkvgneOMo5ARNR1CaJKmI3Ts+8Z05yY/uI1Y8MDvds3Q4wxQ/cGMoC6XoL3Drx3tQeeKCrjO949"
+        "ZYLGGtaXVKtcJ261gBaQ/2d+tZbn0LuP/imRBsBfVCw24lLxQNwAAAAASUVORK5CYII="
+    ),
+    32: (
+        "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"
+        "AAAASUVORK5CYII="
+    ),
+    48: (
+        "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"
+    ),
+    128: (
+        "iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAaxElEQVR4nO2de3RcR5ngf1V17+2npNbDD/kRHOO8bEMCDnHi"
+        "YOyEDQSHx8BEhhlgl2wmkCV7ZgLsObtLBmwBw5w97DA7JAdvDjCBk+FlD+8ZBgyZxCROQhySkIdD1o6d2LFsSZasbqlf996q"
+        "2j9uyw9iybLd6pas/p1zj85Rd9f9quqrr776btV3oUGDBg0aNGjQoMGMQ1S/SCuw1S+1AZXeElVtXacKZYiurs2yb+kssY0H"
+        "DN3CTIZaNahgrViz8QE1e9lau2U95mwV4qy6qmuzVVvWC338/1bcbd3E4L402Sy0nE3pDY6SBVpaSCfLhV/81YXl4z+K+uDM"
+        "FeHMFGDDBkn3RgvCsmGDXCs/uBop347WV1nMeRibAduwA9XDgkRIkbOIA0LKHcaKrcLsv39b9zUlgA0brOzuFuZ0Cz7tTurq"
+        "2qy2bFmvAdZ87oWPYOXtUspLpeNidYi1DQdgMhFCIKSDNRpjwv9njf6/Bwb2fHX3nevKJ7PIpyzvdL68ZsP9zrbua8I1G55d"
+        "IlT8a8qNrzVBEWONUW7CGGOEKY8IE+Qbo7/aWIt0k1bGm6yUjtVBQQqQKpZGlwu/1+WRjz74xTc8NtpHEy12wh01WvDVdzy5"
+        "1os3/0BI1RaWC6GKp2WQ7ZEjex8iv38H/pGXMeXhykKgYQ2qgwAsykvhtiwkuWAFTYtX47UtMtrPG6U8B2Q5KI985KEvvO57"
+        "p6MEE1KAUbP/5s88vcb1Uj+3JkwiVGi17wz87l6Gnv0xwfAhhJAI5YJQZ1XdBmNgDVYHWKtxkm20XLyOjiv+MzLeom1YVNJN"
+        "EJRyf/bQFy773kSng1MqQORcYFd//oVFyqgnwbQgHR0M7Vc9WzdSOPAEMtaEVF5l/reNgT9ZRHEAhBBYHaLLOWLtS5j3to0k"
+        "Opcb4xeRbgxrSqse2LDst8f7a2MhJ3RjCyLQ90rHbUGoMBjar17+4ccpHnwGJ9mBEJFTgjUwqgSNq/qXtZEVMBqExEm2E2Rf"
+        "Yd+PbqPQ83sp3ITFGmm1+M51X3oqtXRpl8WOvxobVwHWbLjf6e4WZk33zg+5yczVYbkQWu07PVs3Eg73ouItWBPSGPL1wGJN"
+        "iPSS2LBMzy8/iy4cVtro0E1mFvvD3ie7u4VZs/GBcefj8bRDYC1dW5C9z+x8WrneJThx0//wJtW//S6cdAdWT9jZbDCJCOkQ"
+        "FgZpff376HzbRmP9gjDGDHjJwpJf/4/Ls1grECcPFI1pAbo2W4kQtvf5natULL7UWGOD7AE19OwPkfFmrJ74clMI0bjO4Joo"
+        "1oSoeAu5F7ZSOrRTWqmMG093lEvxdwKMZwXGfBbQ91zF5TDyBul5VkjXZPf+TAbDvTiJTDQPnaLTpZQYYwjDRoDodBFC4DjO"
+        "0TY8VfsJKQmLWXK772PO3GUWa6zQ8l3At2cvWzvmj8dUgLVgtgFYe5XVoTAIUdi/AyEkp5rzI6E1RwaHiMXjtLW3o5RquAoT"
+        "RYA1hsHBQQqFAk1NTTiOgzFjR3qttQjlUXzld+igIKVUAmFXHLccjIIJf8RYCiC6u4VZs8E61u48z1qD8YuiPPQSQrrjaqOU"
+        "klKphOu63PLx23jHDe9i4XmLcBw3WiA0YoTjU2kjazQ9B17h33+9lXvv+UdyuSFSqTR6rKnXWoR08XM96MKgkOlZgO0c2PVM"
+        "B9CLtXCSaeXkClD5cpnnmmOIFgAT5IUuDYMceySPdv6sWbO58+6v8ZbVV1AMIPCP1qvBaTC3czZXr3oj73nve7nto7ew64U/"
+        "kEynMSdVAouQCuMX0KUcTno2AlLa91qB3g0bEd2nYQGiD+PGUpxgVE8IjDG4rsudd/8jq1evoLe/iHLUaTk0DY7h+5ZcVnPJ"
+        "sou4+557ufFd1zM8PIzjOBP2qaQa/4sTCwRNACUluWyWD3zoP/KW1Svo6y/iei5Syrp709P1klLiei6DA0Uuufg13Ppfb2dk"
+        "ZBgpq9Zt1VMAay2xeJx33PBuioFFqeoJOdNxHEW+aLn2urfT1tZBGFYv/lKVXhJCEAQBbW3tLHzNIoJAIE6hpdZO86saDTdB"
+        "hJQEgWFOZyfz5s3D9/2qWYFq7AkEIgvgOM4pl3vGWpQQOI5guoYGBKCtRRuLrJF/Y61FSYXjulSz4aqmAMApHRNrIRlzKJZD"
+        "ssMBUoppGRswFpIxRVPCoVDWJ1tdTRrVDqhVVQHGw1hLMubwyPMDfPmnuyiUooabbv0/Gk1xpOBj1y9m3eVzKZTDmlmCalMz"
+        "BZBCUCxrvvzTXezuydOUUJjp1vsVhICSb/jyT3bxpiWtZNIuobY1tQTVoiYKYC24SjAw7JMvaVpSDkKAnKYKANCUcAhCw8Cw"
+        "z6yMR6inZ2VqogBCRE5TKu7gOYL+rCYVV9PXCRRQ8jWeK2lJOtO286GKcYBToY2lKeHw0bcvpiXljhWanvIIAAueK7n5uvPp"
+        "bE/gh2Za1gVq7AMUypobLp/L5UsyDOWn8yrAko47zGtPUPL1tHUAoYYKANGIz5dDWtMeHc2xWt56THlOl9GHWtrYae39j1JT"
+        "BRhFG1v3+d9YS6gtSorTflI5+v3p3vlQYwU4PhA0VKjfFPDHgRx5mv04/bv9GDMuEHSuBXLOlhkZCDqXAjlny4wNBJ0rgZyz"
+        "peoPg062cXGqBYKmZyBHYK0Zd2PomVCVQJC1Ftd1GRwc4GDPARzXYu2Jgk6VQNB0DORE7Ss53N9H76GDuJ5XtaeCVbMAUikK"
+        "hTz//qtfcvVVlzGcNUjv2H7CqRQImm6BnDAMac24PPSbB+jv76O1tW3s3cGnSdUUwGhNU1Mz997zDd7zvhu5ZOlrGRgo4rpO"
+        "ZXSJKBBUigJBs5pjdQsCjm7oKJTCSAmnJFGsJAxDmpoT9PQMsunO/0MikazqNFD1HUG53BC33XITd9/zTS65eDH5IgSBrpgs"
+        "gZQQGlv/eVcwhTsfhJC4rqI149LTc5iP33ILL7+0h+bmlqqNfqjywyBjDKlUml0v/IEb3/VOvvIPX+WlvXsIw4DoeHOkuYJo"
+        "/q/rVc2KV5PK8XqtQ3oO7Oeeb9zLn6x7B49s/03VOx8mYRmotSaZSjM8nGPjHZ/mK1/+Ozo7O3HciuNX7RueY4yGmY3R9B46"
+        "RH9fP4lkfFI6HyYpDmCMxnEc2traCIOAF3fvrupGxhmBELiuS2tbK8bYSel8mMRAkLWR0FJKEonEZN3mnGa0DSeTSY8EWmsb"
+        "R8OnMI3jOzOchgLMcOqyIQSOPTeYSPaLc5XRQ6BK1e8EdX12BGk96c7NdGDUPzLGIKXEcWrfHTWfAsIwPMvOPy6aMyWiCtWR"
+        "xxhDEATVE2uC1FTltNZnEMeuZMwS0eNQjMFWyhBCgFQIISt5FA2T/3Rp8uSx1hKGYU0tQc3udPpr2uiIudUh2i9gjUY6MWQs"
+        "heMmAIEJSmh/BB2WAYH0EpWUtWYSAk+1kWfUL6pmEojxqN2ewNMY+UIqjA7QhSxOqp3MopU0LVpJrOMCZLId4aajL4ZFTGEA"
+        "f3APwy8/Rm7/7whyvVHDO7FTprKbqvLMaAUQUhGWcjjJNuZeeROtl6zDpBYQWAdHaJKuIeZGs205hELzQuzsFcxaeiNziwfJ"
+        "7bqPvh3fpjy0Hyfegh3NsXuG1EOeau/6GY+aTgHjUtkiHBaGaF26jgXX3I6fXEgQFLlklmHFYoeL5jczN+ORikUbTYq+pi8b"
+        "sOtgkSf25HnmQBuJ1/0nLrpkHQe3b6L/ie+j3GQls9lpNmqd5bHW1mRpWLc4wAkIAdZighILrv0UHStvZiRf4sr5AX/+lnks"
+        "mRsn4Sl0ZR/B6G7iTMphYUecKy5o5sarDPsOl9m8vY/7diaZ97aNpDpfx76tfwM6iN5jMFElmGryTCJTIxJowQQlFr3zC7Rf"
+        "eStBMccn17XxF9d18sy+ItYKsoWQfNngh1Gjh8bih5Z82TCUDxECnn65wLuvmEV311yUP0R62Y0s+dOvIKQCE058E+JUk2cS"
+        "qbsCCKnQpRzz1/wlzcvehy0d5nPvP4/3r+qgUDbc9YtD7HhxhOaEqpjFYxs6RtsvFVfsOlji7/7lIP25gLdfluF/ffh80hzB"
+        "O281513/GXRQYiLr9Kkmz2RTVwUQUhEWc7QufQcdK29GFwfZuH4RV1zQxP4Bnzecn+KDb+5g09ZeSkF0ju/VWBwJX/1lL9cu"
+        "b+G617fwyoDPhZ1xvvihxSTsEZoueQ9z3vRhdCkbjb5pIk8tqKMCCIwOcFNtzF/7CfKFEre8dTZXXphmKB8ScyW5Qsifr+6g"
+        "WDZseWSA5kQ070abpqKt5s0Jh189neWFnhK3/IfZFMoGV0lyRc2FnXFuv2E+5UKOuVffSrzjtZigNIbpnWry1Ia6KYCQElMe"
+        "YfaKDxCmFvKGhZJ3v6mdI/kQR0UNEmhLW8rhL946m28/eJieIz6eI6M0czK6Rkqau3/dx/pVbZw/O0YpiPb4O0pwJB/ylmUt"
+        "vHVZkqJoYu6VN2HCUhSpm+Ly1Io63VlgdIiTbCdzyToIi6xfNSsaCMe94kZJQa6ouf4NGea1eXz9vj5akopcMeDISEBr2uH7"
+        "Dw+gteUDV3cwXNQn7PSVQuAHhhuvmkVClEgvXkusbREmiCJ1U1ee2lGXZaAQAuMXSC9aiUkt5KJZmkvPT1MoG/44AGYtSAG3"
+        "39DJHd/dz8c2PcuLPUNoY7lwfgt7Bz0+cUMnzQlFthCeMC/LyiHQxXPjrFjksf2lBC2LV9H3+Hdw3GORuakmTy2pjwUQAms0"
+        "zYtWElrF5YtTxF2JOVmwSEQBkUefP0S+WOTp/SEDwz5DeZ/f7wsYKZb57R8O4mt70n3+lmjkXXFBE8YYml6zsuJ4HZeYWUqw"
+        "pm7yMNOmAGstwokR61iCIzQXzk8QVAIq2tijV6CjnALbnj3MXf+6l9AfIZNOkIwniHkxWpubEDrPvffv48eP9pCKKYLQRLto"
+        "K5e1grJveO3cBElH42bOB5Ug8IsEQUAQBPh+GY0k1l4feZxYU+Xta7WnPpFAo1FeCpmcRcK1dLZ6pGIST514YsNYS9IT/PP2"
+        "/ShpMdpneCRHPNGMtYZ8YYSyXyQVl/zz9v2sv3o+bU3uifey0Qmg2S0uzXHoj2fomP9adGEApAujsXmpcNKzSbimxvK04CQz"
+        "+Lm+KDpY4wNztVeAivl3vAQ4SZJulHD5iz86QK6oceSxJNJCgDGWlwcdZrV1HI2NR+8gUFhrSKfbAEGuDHd8d1/FdP/RLYGP"
+        "XDOLloSgT8ZY96c3ETc5DAqwCCwajx22jbhrkELWRp6koG8ojvLSWHsQIbyan5+o47OAaAdNJexOfy4kWwijBgeoHB+P1tkS"
+        "pUZ/cwwpJdGLMaNy+nMBniNPeDeRJUpEEWX2jsqIxRMkCDH2mAKEeIiiOJpCpnbyvLqcWlJ7BbAWISQmKCJ0kWIQNeyXPnQe"
+        "gbajr8eN4vFA3JXc9A+P8/juIZKeJBZvIhZLYq1B64B8/giBhgXtCe66eSmuEpjjcg/YiskdyofkihZhyvxm6w+hPATCIVIA"
+        "MEKhVl5AKZZEYGsjT8EijI8J8pVdRLXfHFsfCyAloZ/HFAYoNJ9H75DPvLZYtOw6bjCM5uN/98r5bH9+kOZkjHSqmdzwIEZr"
+        "MplZ6LDEwOFh3nn9PFxHkc0HJyy9jIWYKzicC8iWAD/LzicexIT+cRE4gdU+S5f1Qnp+zeUJikMIGSljranLKkAIiQ3LlAf3"
+        "EBjJroNFXBUNs+NP8DpKkC9prn/jXD58zUKEk2KkWML3S4TaJ5fPY2WKd1/RyZ+9ZQH5UhS1O74MsHiOZG9vkXwgCbP7cAhI"
+        "pJpIJJLRlUrjOZJgcG9d5Dn6NrY6UNdnAcP7HkMJyxN78vihOWmmDmMtSlquX7GQZCLJgoxByWj9viBjiMc8rnvjeaTiinCM"
+        "tGNCWB5/cQSEYmTfDkzon3guoXI2IVcneawOZta5AGsM0k0y/PLjdJYO8VxPG8+/UmDpwhRF/0SzK4VAG8ud/3aIqy9K8+n3"
+        "XsgLPXmMsVw0P823Huhn09ZDXHlh6th8O3ofCzFXsv+wz2N7SngmJLtnO8KNn5DDaKrJU0vqZAEs0nEJhnvJ7fo1oUzwg0cO"
+        "V5Zcx0ZN9HRN8YsnsxwY9Ln52ln4oeX82SmWdKbxQ8v6Ve1IIfje9oEo96A58fcJT/KTxw6TC2IU9z1MsX83yk38kcM11eSp"
+        "HXWbAqwxSC9J345vEwv62b67zH3PDJFJHUvb5irBYD7k6/f18cHVHcxr9SgGBj80lCt/03HFx66bzeaHB9nbVybuRsuu0Fia"
+        "k4on94zwr0/mSCqfQ4/eg5Anf+niVJOnVtTRB7BIJ0Z5aD8HH9pEPNnEXf/Wwws9RZqTinJgaU46fOfBwyRikq6r2o8GZkYd"
+        "qujpXMh1r2/honlxvvbrPpIxSaAtKU/Slwv53z99BRHLcPjxe8kfeBrlJcfYizfV5KkNdd0RZI1GxVvof+L75J79AWXVyh3f"
+        "3svugyXmtbk8sSfPdx46zH952xzibjT3vhpBaODj18/h/mezbH06S2ery+HhkE//0x76Smn8fds4+NAmVLxp3CduU02eWlD3"
+        "PYFYi/KS7Nv6N/j7HmSEVv77P+1l23NZWlKKW982hxWLU+SKUT6/E2fuyMHKlzRL5sT5y3WdzM24PLk3z3/71ou8MpJCDP2B"
+        "vT+7o7IOm0B1p5o8k0z9JcBW1sCWF394O/nnf4yvMtzx/R62bO/j2uXNJDxJc0IRcwXqOI9cCfBcQUtS4TqCa5c3s33nEJ/4"
+        "5ssMhhn0gYfY9b2PoUs5pPImaGqnmjyTy9Q4F2ANQrpgQvb+7H8y59BO5l59Kz9/znLfzpd40/kxVi5p4rWdCTqaXOJepLdF"
+        "33BkJGBPb4nHXxzh0d1FcmGctOtw+LebOPjQJhAiOpZ1Oo091eSZRGqmAEKI8b1da0AqVCxN72PfJPvig8y96iZii9fy8EtJ"
+        "HtozQtLJ0pKApBeZ2mIA2SLkAwlC4ZkQ9v2K3Y/eQ77naVSsCYQ8s8auszy1CgxNHQWAo0kSnUQGP3uAl/7lM8TbXkPz+ato"
+        "es1Kym2L6MtnwIkDAnQZ/Cwmu4+RfTvI7tlOqX83SAcnkYkcrLMZaXWSp1YHQ6GGCqCUmvChR2s0wvFw3Dh+7hB9v/tOdK4u"
+        "3oSTaEHFotO42i8QFofQpWGsDpBuHBVrirZpV9G7rrU856QCCCGQUk785Ku1WHus4bEWq0P84T5s9mClTImQDtJLVSyMmby5"
+        "tUbyjLZTraipE+g4DkEQnF7kq9LwAAiBkC5CeaMfUhletYukTqI8Qoia5wmq+SrAdV3CMDzzM/B29BzOFKFK8kgp65ItrC7L"
+        "QMdxTkgRN9PTxEkpa2r2j6ducYDjKz2TFaDeTIlA0FRoiJnKFAgFN6gnDQWY4TQUYIbTUIAZTn1TxFSWQTOVqVD/Op0LiCod"
+        "hkHljWIzayUwlepfcwUQQqDD6Ch0W/sc2trnAKDDcEYowVSrf03jAEIItA5JNTWz/LIraWrJADCcHeLZpx4lP5JDqfrukp1M"
+        "pmL9a2oBrLVIqVh+2ZVk2trRYYgOQzJt7Sy/7EqkVOds58PUrH/NFGDU9LVk2mluyeCXSkedIL9UorklQ0um/ZydCqZq/RvL"
+        "wBlOzRTAWotyHLJDA+SyQ3jx+NEngV48Ti47RHZoAOWcmz7AVK3/uAoQelJYW730FUIIjNE8+9SjDA1GlVWOw9DgAM8+9SjG"
+        "6HPS/I9Su/qPKpDAqPELPPkqoPKbhTlG+gTDQEY6Cau8lNCFwSizxhkoqbUWpRzywzl2PHwfLZl2ALJDAxitz9nRP8rk1l9g"
+        "rUZ6SaSXRmCx2KLr2BxA90Ys3a/+1VjLQGutFUIIf81nn3tFCLFQxpqs17KA8sBehBPnTHfBjJpCay2DA70AKOWc850/yqTV"
+        "XwBhgNc0FyfVbokyGvYeyeT7o89PbgjGnALWbqSSskLsENKxUjk2seDyaGPkWZqp0Yo6jovjuCf8byYwGfUXQmK0T6LzUpSX"
+        "NkI6FsTvf/exy4Ours3RUaeTMKYCzF4W/UAo/XNrtdBBQTYtXo2TbMPq6iQ1nMnbwaC69bfWIp04TRe8FWMChFQCIX4O0Le0"
+        "a8wRO6YCbFkvDFgRz8QeCEuFlyRCeG2LTMvF70CXcwg1JTYTNQCEdNClLOnFq0nOu9QSlFVYGh4OKP8YYNtGxjyUMN4qwK7Z"
+        "8ID6xV9dWEbKv1extNB+3rRfcTOxjiWYcr7uLztoAAiJCcs4qXZmr7oNqwPtJJqFtfYbj3Rf1te12SqEGNPMnGIyt2LDBsRO"
+        "nnP6UE9Ix1tmEbp06Dm170e3YcMy0kvVLc/tTEdIBxOWsdpnwTu/RNOSa4wNisJaDgNLt/HdQTZutOMpwCkCQcLu3LlFbOle"
+        "7ltlPowlsLokEp3LzcI/+QpO01zCwmBFGFU5737uruPrT5RTIGprgS4eQXqJSuevtbo8YpSXEsaYm7Z1X3y4a9kyMV7nV0o8"
+        "NV2brdqyXujVn33m/Y6X+p7xi1a4SaMLh1X/I5vIvfArtD+MUB5CuQjRmBomBWuwOsBoH+nESS9ezexVt+G1LTK6PGzdREaF"
+        "xaFPbvvc8r8f7bNTFTnh4bpmw/3Otu5rwjf/9TMfcOOpezHa0UaHyk2oUt/zYnjXfeRfeYIgdwDjF86uog1OinQTOOk5JOdf"
+        "StOSt5Kcd6m1OtBY4ygvSVDMfeo3n1/+5dG+mkiZp2WvjyrBZ5652nUTX1de4uKwlMNKR0snjgkKQucHhS7nzqyGDcZFeimc"
+        "VLuVXtqiA2vCkuMkmtFBqUf75Y8/+PllPzmdzoczmLBHTcvrP/VUqq05/Smwtyo31mmtOeoMVvHxQYPjGM1IJKSDEAodFI8g"
+        "xLfKOv+3ox7/RMz+iWWeAV1dm9WWLes1wJv/9ulWJ0ytw5h11urLwczFmKazKb/Bq7AgsEIUhJC9QqinhBC/DKX/swf/eulB"
+        "OLFPToez6CArujYjj9e4rs1WDeza02G1n8EHvHF+3mDi+IAXw5My1xyMDGzpXu6PftS12aotXZhTefuTh7VizYb7na7NtuH6"
+        "14iurs1qzYb7ncrbKc6KKptoK7CwYWPD9E8G3RtH3at6jfYGDRo0aNCgQYMG5wT/H60mcJ/JbK4ZAAAAAElFTkSuQmCC"
+    ),
+}
+
 
 # Speaker-bias source options for the 5.1 speaker-mapping controls
 # (Step 5, Space section). Ordered list of (internal_key, display_label);
@@ -446,7 +633,7 @@ class WizardState:
         self.preview_start_s: float = cfg.get("preview_start_s", 0.0)
         self.preview_duration_s: int = cfg.get("preview_duration_s", 15)
 
-        self.device_key: str = cfg.get("device_key", "general")
+        self.device_key: str = cfg.get("device_key", "")
         self.content_key: str = cfg.get("content_key", "")  # "" = auto-detect
         self.content_auto_detected: str = ""
         self.content_confidence: float = 0.0
@@ -478,6 +665,11 @@ class WizardState:
         p["fade_in_ms"] = self.fade_in_ms
         p["fade_out_ms"] = self.fade_out_ms
         p["demucs_model"] = self.demucs_model
+        # Selecting "none" in Step 4 must fully disable stem separation,
+        # even when the content profile would otherwise request it.
+        if self.demucs_model == "none":
+            p["use_stems"] = False
+            p["use_demucs"] = False
         p["use_cache"] = self.use_cache
         p["use_voicefixer"] = self.use_voicefixer and self.experimental_ack
         p["use_deepfilternet"] = self.use_deepfilternet and self.experimental_ack
@@ -586,6 +778,13 @@ class Step1Source(ttk.Frame):
         self.disk_label = ttk.Label(self, text="", foreground="#e5a50a")
         self.disk_label.grid(row=r + 1, column=0, columnspan=3, sticky="w", pady=(10, 0))
 
+        # Recompute the estimate whenever format/bitrate change too, not
+        # just on browse — a bitrate change can noticeably move the
+        # estimate for a large batch.
+        self.fmt_var.trace_add("write", lambda *_: self._update_disk_estimate())
+        self.bitrate_var.trace_add("write", lambda *_: self._update_disk_estimate())
+        self._update_disk_estimate()
+
     def _browse_input(self):
         if self.mode_var.get() == "file":
             path = filedialog.askopenfilename(
@@ -596,11 +795,73 @@ class Step1Source(ttk.Frame):
             path = filedialog.askdirectory(title="Select folder of audio files")
         if path:
             self.input_var.set(path)
+            self._update_disk_estimate()
 
     def _browse_output(self):
         path = filedialog.askdirectory(title="Select output folder")
         if path:
             self.output_var.set(path)
+            self._update_disk_estimate()
+
+    def _update_disk_estimate(self):
+        """Populate the previously-unwired disk_label with an estimate of
+        output size and free space, using engine.estimate_disk_usage /
+        check_disk_space (both already existed but nothing called them
+        from here). This runs before Step 2/3 have set a device or
+        content profile, so it assumes plain stereo output at the chosen
+        format/bitrate — a conservative baseline; a 5.1 device profile
+        chosen later will use more space (extra MKV/AC3 track) than this
+        estimate shows.
+        """
+        input_str = self.input_var.get().strip()
+        output_str = self.output_var.get().strip()
+        if not input_str or not output_str or core is None:
+            self.disk_label.configure(text="")
+            return
+        p = Path(input_str)
+        if not p.exists():
+            self.disk_label.configure(text="")
+            return
+        try:
+            files = core.collect_audio_files(p)
+            if not files:
+                self.disk_label.configure(text="")
+                return
+            params = {
+                "layout": "stereo",
+                "output_format": self.fmt_var.get(),
+                "bitrate": self.bitrate_var.get().strip() or "320k",
+                "also_produce_stereo_mp3": False,
+            }
+            estimated = core.estimate_disk_usage(files, params)
+            out_dir = Path(output_str).expanduser()
+            check_dir = out_dir
+            while not check_dir.exists() and check_dir != check_dir.parent:
+                check_dir = check_dir.parent
+            ok, free = core.check_disk_space(check_dir, estimated)
+            gb = estimated / 1e9
+            note = " (stereo estimate — 5.1 output will use more)"
+            if free >= 0:
+                free_gb = free / 1e9
+                if ok:
+                    self.disk_label.configure(
+                        text=f"Estimated output size: ~{gb:.2f} GB for {len(files)} file(s), "
+                             f"{free_gb:.1f} GB free.{note}",
+                        foreground="#555555",
+                    )
+                else:
+                    self.disk_label.configure(
+                        text=f"⚠ Estimated output ~{gb:.2f} GB may exceed free disk space "
+                             f"({free_gb:.1f} GB free).{note}",
+                        foreground="#c01c28",
+                    )
+            else:
+                self.disk_label.configure(
+                    text=f"Estimated output size: ~{gb:.2f} GB for {len(files)} file(s).{note}",
+                    foreground="#555555",
+                )
+        except Exception:
+            self.disk_label.configure(text="")
 
     def commit(self):
         self.state.input_mode = self.mode_var.get()
@@ -660,7 +921,12 @@ class Step2Device(ttk.Frame):
             card.grid(row=row, column=col, sticky="nsew", padx=8, pady=8)
             self.cards[key] = card
 
-        self._select(state.device_key)
+        # First time through (no device chosen yet), pre-select the first
+        # tile so the step never starts with nothing selected. On later
+        # visits, keep whatever was already chosen.
+        initial_key = state.device_key or (keys[0] if keys else "")
+        if initial_key:
+            self._select(initial_key)
 
     def _select(self, key: str):
         self.state.device_key = key
@@ -671,6 +937,8 @@ class Step2Device(ttk.Frame):
         pass  # already committed via _select
 
     def validate(self) -> str | None:
+        if not self.state.device_key:
+            return "Please select a target device before continuing."
         return None
 
 
@@ -717,13 +985,24 @@ class Step3Content(ttk.Frame):
             self.cards[key] = card
 
         self._detected = False
+        self._detected_input: str | None = None
 
     def run_detection(self, log_fn=None):
         """Run auto-detection on the first input file. Called when the
-        wizard advances into this step."""
-        if self._detected:
+        wizard advances into this step.
+
+        Re-runs whenever the input path/mode has changed since the last
+        detection (e.g. the user went back to Step 1 and picked a
+        different file or folder) rather than only ever running once per
+        app session — otherwise the badge and pre-selected content type
+        keep reflecting whatever file was loaded first, even after the
+        input changes.
+        """
+        input_signature = f"{self.state.input_mode}:{self.state.input_path}"
+        if self._detected and self._detected_input == input_signature:
             return
         self._detected = True
+        self._detected_input = input_signature
         try:
             p = Path(self.state.input_path)
             files = core.collect_audio_files(p)
@@ -876,21 +1155,22 @@ class Step5DSP(ttk.Frame):
         self.state = state
         self.columnconfigure(0, weight=1)
         self.vars: dict[str, tk.Variable] = {}
+        self.ideal_labels: dict[str, tk.Label] = {}
+        self.last_recommendations: dict = {}
+        self.last_measurements: dict = {}
         self._preview_playing = False
         self._active = True  # False once the user navigates away from this step
 
-        title_row = ttk.Frame(self)
-        title_row.grid(row=0, column=0, sticky="ew", pady=(0, 4))
-        ttk.Button(title_row, text="↺ Reset to Defaults", command=self._reset_to_defaults).pack(
-            side="right", padx=(0, 4), pady=(6, 6)
-        )
-
+        # Analysis report and the Device/Content label are no longer shown
+        # at the top of the screen — the widgets still exist (and are kept
+        # up to date by refresh_profile_label()/_analyze_track() etc. below)
+        # so none of that logic needs to change, they're just never gridded.
+        self.analysis_status = ttk.Label(self, text="", foreground="#555555", wraplength=700, justify="left")
         self.profile_label = ttk.Label(self, text="", foreground="#555555")
-        self.profile_label.grid(row=1, column=0, sticky="w", pady=(0, 8))
 
         scrollable = ScrollableFrame(self)
-        scrollable.grid(row=2, column=0, sticky="nsew")
-        self.rowconfigure(2, weight=1)
+        scrollable.grid(row=0, column=0, sticky="nsew")
+        self.rowconfigure(0, weight=1)
         body = scrollable.inner
         body.columnconfigure(0, weight=1)
 
@@ -914,16 +1194,18 @@ class Step5DSP(ttk.Frame):
         # --- Dynamics section ---
         dyn_section = CollapsibleSection(body, "Dynamics", expanded=True)
         dyn_section.grid(row=1, column=0, sticky="ew")
+        self._bool_row("multiband_compress", "Multiband compression", dyn_section.body, 0)
+        self._bool_row("deesser", "De-esser (vocal sibilance)", dyn_section.body, 1)
+        self._float_row("final_lufs", "Target loudness (LUFS)", dyn_section.body, 2, -30, -5)
+        self._bool_row("auto_loudness", "Auto loudness (let ffmpeg two-pass loudnorm decide)", dyn_section.body, 3)
+        self._float_row("headroom_db", "Peak headroom (dB)", dyn_section.body, 4, 0, 3)
         ttk.Label(
             dyn_section.body,
             text="Controls compression and overall output loudness. Target loudness sets "
                  "the final master's level (applies always); multiband compression and the "
                  "de-esser shape dynamics before that final level is set.",
             foreground="#888888", font=("TkDefaultFont", 8), wraplength=520, justify="left",
-        ).grid(row=3, column=0, columnspan=3, sticky="w", padx=6, pady=(4, 0))
-        self._bool_row("multiband_compress", "Multiband compression", dyn_section.body, 0)
-        self._bool_row("deesser", "De-esser (vocal sibilance)", dyn_section.body, 1)
-        self._float_row("final_lufs", "Target loudness (LUFS)", dyn_section.body, 2, -30, -5)
+        ).grid(row=5, column=0, columnspan=3, sticky="w", padx=6, pady=(4, 0))
 
         # --- Vocal Chain section (stem-based vocal processing) ---
         vocal_section = CollapsibleSection(body, "Vocal Chain (stem-based)", expanded=True)
@@ -956,22 +1238,25 @@ class Step5DSP(ttk.Frame):
         # --- Space section ---
         space_section = CollapsibleSection(body, "Space (stereo / surround)", expanded=True)
         space_section.grid(row=3, column=0, sticky="ew")
-        ttk.Label(
-            space_section.body,
-            text="Stereo width, warmth, and clarity effects on the final master. Crossfeed "
-                 "is meant for headphone listening and will sound odd on speakers.",
-            foreground="#888888", font=("TkDefaultFont", 8), wraplength=520, justify="left",
-        ).grid(row=4, column=0, columnspan=2, sticky="w", padx=6, pady=(4, 0))
         self._bool_row("width_bands", "Per-band stereo width", space_section.body, 0)
         self._bool_row("saturation", "Tape saturation", space_section.body, 1)
         self._bool_row("crystalizer", "Crystalizer (clarity)", space_section.body, 2)
         self._bool_row("crossfeed", "Headphone crossfeed", space_section.body, 3)
+        self._float_row("width_mid", "Stereo width — mid band", space_section.body, 4, 0.5, 3.0)
+        self._float_row("width_treble", "Stereo width — treble band", space_section.body, 5, 0.5, 3.0)
+        ttk.Label(
+            space_section.body,
+            text="Stereo width, warmth, and clarity effects on the final master. Crossfeed "
+                 "is meant for headphone listening and will sound odd on speakers. Width "
+                 "sliders only take effect when \"Per-band stereo width\" above is on.",
+            foreground="#888888", font=("TkDefaultFont", 8), wraplength=520, justify="left",
+        ).grid(row=6, column=0, columnspan=2, sticky="w", padx=6, pady=(4, 0))
 
         # --- 5.1 speaker mapping (only meaningful for a 5.1 device
         # profile's surround output; hidden/shown by refresh_profile_label()) ---
         self.speaker_bias_vars: dict[str, tuple] = {}
         self.speaker_bias_frame = ttk.Frame(space_section.body)
-        self.speaker_bias_frame.grid(row=5, column=0, columnspan=4, sticky="ew", pady=(10, 0))
+        self.speaker_bias_frame.grid(row=7, column=0, columnspan=4, sticky="ew", pady=(10, 0))
         ttk.Label(
             self.speaker_bias_frame, text="5.1 Speaker Mapping",
             font=("TkDefaultFont", 9, "bold"),
@@ -994,23 +1279,48 @@ class Step5DSP(ttk.Frame):
             rest_section.body,
             text="Cleans up the source before any EQ/dynamics are applied. Declick removes "
                  "pops/clicks; Denoise reduces hiss (aggressive settings can also dull real "
-                 "high-frequency detail).",
+                 "high-frequency detail — use \"Analyze Track\" above for a level tuned to "
+                 "this specific recording instead of guessing).",
             foreground="#888888", font=("TkDefaultFont", 8), wraplength=520, justify="left",
-        ).grid(row=5, column=0, columnspan=2, sticky="w", padx=6, pady=(4, 0))
+        ).grid(row=6, column=0, columnspan=2, sticky="w", padx=6, pady=(4, 0))
         self._bool_row("declick", "Declick / declip", rest_section.body, 0)
         self._bool_row("denoise", "Denoise", rest_section.body, 1)
+        self._float_row("denoise_amount", "Denoise amount (afftdn nr, 0-20)", rest_section.body, 2, 0, 20)
         self.trim_var = tk.BooleanVar(value=state.trim_silence)
-        ttk.Checkbutton(rest_section.body, text="Trim silence", variable=self.trim_var).grid(row=2, column=0, sticky="w", padx=6, pady=2)
-        ttk.Label(rest_section.body, text="Fade in (ms):").grid(row=3, column=0, sticky="w", padx=6)
+        ttk.Checkbutton(rest_section.body, text="Trim silence", variable=self.trim_var).grid(row=3, column=0, sticky="w", padx=6, pady=2)
+        ttk.Label(rest_section.body, text="Fade in (ms):").grid(row=4, column=0, sticky="w", padx=6)
         self.fade_in_var = tk.IntVar(value=state.fade_in_ms)
-        ttk.Spinbox(rest_section.body, textvariable=self.fade_in_var, from_=0, to=10000, width=8).grid(row=3, column=1, sticky="w")
-        ttk.Label(rest_section.body, text="Fade out (ms):").grid(row=4, column=0, sticky="w", padx=6)
+        ttk.Spinbox(rest_section.body, textvariable=self.fade_in_var, from_=0, to=10000, width=8).grid(row=4, column=1, sticky="w")
+        ttk.Label(rest_section.body, text="Fade out (ms):").grid(row=5, column=0, sticky="w", padx=6)
         self.fade_out_var = tk.IntVar(value=state.fade_out_ms)
-        ttk.Spinbox(rest_section.body, textvariable=self.fade_out_var, from_=0, to=10000, width=8).grid(row=4, column=1, sticky="w")
+        ttk.Spinbox(rest_section.body, textvariable=self.fade_out_var, from_=0, to=10000, width=8).grid(row=5, column=1, sticky="w")
+
+        # --- Analyze Track button group (sits directly above the Preview
+        # pane below; bordered like the Preview pane, items left-aligned) ---
+        title_row = ttk.LabelFrame(self, text="Analyze Track")
+        title_row.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        ttk.Button(title_row, text="🔍 Analyze Track", command=self._analyze_track).pack(
+            side="left", padx=(6, 4), pady=(6, 6)
+        )
+        self.thorough_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            title_row, text="Thorough (full track + Demucs, slower)", variable=self.thorough_var,
+        ).pack(side="left", padx=(4, 8), pady=(6, 6))
+        self.analysis_info_btn = ttk.Button(
+            title_row, text="📋 Analysis Info", command=self._show_analysis_info, state="disabled",
+        )
+        self.analysis_info_btn.pack(side="left", padx=(0, 4), pady=(6, 6))
+        self.apply_ideal_btn = ttk.Button(
+            title_row, text="Apply Ideal Values", command=self._apply_ideal_values, state="disabled",
+        )
+        self.apply_ideal_btn.pack(side="left", padx=(0, 4), pady=(6, 6))
+        ttk.Button(title_row, text="↺ Reset to Defaults", command=self._reset_to_defaults).pack(
+            side="left", padx=(0, 4), pady=(6, 6)
+        )
 
         # --- Preview controls ---
         preview_frame = ttk.LabelFrame(self, text="Preview")
-        preview_frame.grid(row=3, column=0, sticky="ew", pady=(12, 0))
+        preview_frame.grid(row=2, column=0, sticky="ew", pady=(12, 0))
         preview_frame.columnconfigure(3, weight=1)
         self.preview_status = ttk.Label(preview_frame, text="Not previewed yet.")
         self.preview_status.grid(row=0, column=0, columnspan=3, sticky="w", padx=6, pady=4)
@@ -1055,6 +1365,7 @@ class Step5DSP(ttk.Frame):
         scale.grid(row=row, column=1, sticky="w", padx=6)
         val_label = ttk.Label(parent, text=f"{default:+.1f}", width=6)
         val_label.grid(row=row, column=2)
+        self._add_ideal_label(key, parent, row, column=3)
 
         # Slider drags produce raw floats like 3.478291023841 -- show a
         # clean, fixed-precision value instead of that directly, updated
@@ -1071,6 +1382,17 @@ class Step5DSP(ttk.Frame):
         var = tk.BooleanVar(value=default)
         self.vars[key] = var
         ttk.Checkbutton(parent, text=label, variable=var).grid(row=row, column=0, sticky="w", padx=6, pady=2)
+        self._add_ideal_label(key, parent, row, column=1)
+
+    def _add_ideal_label(self, key: str, parent, row: int, column: int):
+        """Small 'Ideal: —' label shown next to a control, filled in by
+        _analyze_track() and left blank until analysis has run. Kept in
+        self.ideal_labels so _analyze_track()/_apply_ideal_values() can
+        find it by parameter key regardless of which control type it's
+        attached to (slider, checkbox, spinbox)."""
+        lbl = tk.Label(parent, text="", font=("TkDefaultFont", 8), fg="#1a5fb4")
+        lbl.grid(row=row, column=column, sticky="w", padx=(8, 0))
+        self.ideal_labels[key] = lbl
 
     def _speaker_bias_row(self, group_key: str, label: str, parent, row: int):
         """One speaker-mapping row: a source dropdown (Off/Vocals/Band1-5)
@@ -1111,6 +1433,7 @@ class Step5DSP(ttk.Frame):
         self.vars[key] = var
         ttk.Label(parent, text=label, width=36, anchor="w").grid(row=row, column=0, sticky="w", padx=6)
         ttk.Spinbox(parent, textvariable=var, from_=lo, to=hi, increment=0.5, width=8).grid(row=row, column=1, sticky="w")
+        self._add_ideal_label(key, parent, row, column=2)
 
     def _update_eq_canvas(self):
         preview_params = {
@@ -1231,6 +1554,210 @@ class Step5DSP(ttk.Frame):
         self._reset_speaker_bias_vars()
         self._update_eq_canvas()
         self.preview_status.configure(text="Reset to profile defaults.")
+
+    def _analyze_track(self):
+        """Analyze the input file and populate the "Ideal: X" labels next
+        to each affected control — mirroring this project's earlier
+        CLI+GUI tool (analyze_track()/compute_recommendations() + the
+        "Apply Ideal Values" button). Analysis only fills in the
+        ideal-value labels; nothing is applied to the actual sliders
+        until the user reviews the recommendations and clicks "Apply
+        Ideal Values" — same two-step review flow as before, rather than
+        silently overwriting the sliders the moment analysis finishes.
+
+        The "Thorough" checkbox trades speed for depth: unchecked, this
+        analyzes at most the first 120 seconds and only runs Demucs
+        vocal/instrument separation if a stem model happens to be
+        selected in Step 4 already — fast, seconds at most. Checked, it
+        analyzes the FULL track, always attempts Demucs (if installed)
+        regardless of the Step 4 selection, and computes sturdier
+        band/loudness measurements (windowed medians and an approximate
+        loudness range instead of one aggregate number) — this can take
+        anywhere from tens of seconds to a few minutes depending on track
+        length and whether Demucs runs.
+
+        This is separate from Step 3's content-type auto-detection: that
+        picks a discrete era/style BUCKET (e.g. "Cassette Era") whose
+        defaults are shared across every recording in that bucket. This
+        looks at the specific file's own measured levels/tonal balance and
+        recommends values tuned to that one file.
+        """
+        if not self.state.input_path:
+            self.analysis_status.configure(text="No input file selected.")
+            return
+        self.commit()
+        thorough = self.thorough_var.get()
+        busy_text = (
+            "Analyzing full track — this can take a while (Demucs stem separation)…"
+            if thorough else "Analyzing track…"
+        )
+        self._set_preview_busy(True, busy_text)
+        input_path = self.state.input_path
+        # Reuse whatever Step 4 chose for stem separation — matches the
+        # earlier tool's behaviour of reusing its "Use True Demucs
+        # Separation" checkbox for analysis rather than a separate toggle.
+        # Thorough mode always attempts Demucs (if installed) regardless
+        # of the Step 4 selection, since that's the biggest lever for a
+        # more complete analysis and worth running independent of the
+        # export choice.
+        want_demucs = thorough or self.state.demucs_model not in ("", "none")
+        demucs_model = self.state.demucs_model if self.state.demucs_model not in ("", "none") else "htdemucs"
+        music_lufs_ref = float(self.state.params.get("music_lufs", -18.0))
+
+        def _work():
+            try:
+                files = core.collect_audio_files(Path(input_path))
+                if not files:
+                    self.after(0, lambda: self._set_preview_busy(False, "No audio files found to analyze."))
+                    return
+                if not core.CAP.numpy:
+                    self.after(0, lambda: self._set_preview_busy(
+                        False, "Analysis needs numpy, which isn't installed."))
+                    return
+                first_file = files[0]
+                seg = core.load_audio_file(first_file)
+                if thorough:
+                    # Full track, no cap — this is the whole point of
+                    # thorough mode: give the analysis every second of
+                    # audio instead of just the first couple of minutes.
+                    seg_for_measurement = seg
+                else:
+                    # Cap the analysis window so a very long track doesn't
+                    # make this feel slow — a couple of minutes is plenty
+                    # of signal for level/tonal-balance estimates.
+                    max_ms = 120_000
+                    seg_for_measurement = seg[:max_ms] if len(seg) > max_ms else seg
+                audio, sr = core.pydub_to_float32(seg_for_measurement)
+                result = core.analyze_track_for_optimal_params(
+                    audio, sr,
+                    input_path=first_file,
+                    use_demucs=want_demucs,
+                    demucs_model=demucs_model,
+                    music_lufs_reference=music_lufs_ref,
+                    elaborate=thorough,
+                )
+
+                def _finish():
+                    # Analysis reused the Preview section's busy indicator
+                    # (progress bar + disabled buttons) while it ran — that
+                    # left the Preview status label stuck on "Analyzing
+                    # full track…" forever, since the plain False-only call
+                    # here never supplied replacement text. Explicitly hand
+                    # it back to a neutral preview message so it doesn't
+                    # look like analysis is still (or always) running.
+                    self._set_preview_busy(False, "Not previewed yet.")
+                    self.last_recommendations = result.get("recommendations", {})
+                    self.last_measurements = result.get("measurements", {})
+                    self._update_ideal_labels()
+                    self.apply_ideal_btn.configure(
+                        state="normal" if self.last_recommendations else "disabled"
+                    )
+                    self.analysis_info_btn.configure(
+                        state="normal" if (self.last_recommendations or self.last_measurements)
+                        else "disabled"
+                    )
+                    m = dict(self.last_measurements)
+                    # vocal_analysis_status is pulled out and shown separately
+                    # (rather than lost in the generic k=v dump) since it's
+                    # the one thing that explains why analysis might have
+                    # finished unusually fast: the Demucs vocal/instrument
+                    # step is by far the slowest part when it runs, and
+                    # silently doesn't when it can't.
+                    vocal_status = m.pop("vocal_analysis_status", None)
+                    parts = [f"{k}={v}" for k, v in m.items()]
+                    status_line = "Analysis complete — " + ", ".join(parts) + "."
+                    if vocal_status and vocal_status != "ok":
+                        status_line += f"  Vocal/instrument analysis: {vocal_status}."
+                    status_line += (
+                        "  Review the \"Ideal\" values below, then click "
+                        "\"Apply Ideal Values\" to use them."
+                    )
+                    self.analysis_status.configure(text=status_line)
+                self.after(0, _finish)
+            except Exception as exc:
+                self.after(0, lambda: self._set_preview_busy(False, f"Analysis failed: {exc}"))
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _update_ideal_labels(self):
+        """Refresh every 'Ideal: X' label from self.last_recommendations."""
+        for key, lbl in self.ideal_labels.items():
+            if key not in self.last_recommendations:
+                lbl.configure(text="")
+                continue
+            value = self.last_recommendations[key]
+            if isinstance(value, bool):
+                lbl.configure(text=f"Ideal: {'On' if value else 'Off'}")
+            elif isinstance(value, float):
+                lbl.configure(text=f"Ideal: {value:+.1f}")
+            else:
+                lbl.configure(text=f"Ideal: {value}")
+
+    def _show_analysis_info(self):
+        """Show the full analysis log (every measurement and every
+        recommendation, not just the one-line summary above the sliders)
+        in a pretty-printed, read-only popup. Disabled until an analysis
+        has actually produced something to show."""
+        if not self.last_measurements and not self.last_recommendations:
+            return
+
+        def _fmt_value(v):
+            if isinstance(v, bool):
+                return "On" if v else "Off"
+            if isinstance(v, float):
+                return f"{v:+.2f}"
+            return str(v)
+
+        def _section(title: str, data: dict) -> list[str]:
+            lines = [title, "-" * len(title)]
+            if not data:
+                lines.append("  (none)")
+            else:
+                key_width = max(len(k) for k in data)
+                for k, v in data.items():
+                    lines.append(f"  {k.ljust(key_width)} : {_fmt_value(v)}")
+            return lines
+
+        lines: list[str] = []
+        lines += _section("Measurements", self.last_measurements)
+        lines.append("")
+        lines += _section("Recommendations (\"Ideal\" values)", self.last_recommendations)
+
+        win = tk.Toplevel(self)
+        win.title("Analysis Info")
+        win.geometry("560x480")
+        win.columnconfigure(0, weight=1)
+        win.rowconfigure(0, weight=1)
+
+        text_frame = ttk.Frame(win, padding=8)
+        text_frame.grid(row=0, column=0, sticky="nsew")
+        text_frame.columnconfigure(0, weight=1)
+        text_frame.rowconfigure(0, weight=1)
+
+        txt = tk.Text(text_frame, wrap="word", font=("TkFixedFont", 10))
+        txt.grid(row=0, column=0, sticky="nsew")
+        scroll = ttk.Scrollbar(text_frame, orient="vertical", command=txt.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        txt.configure(yscrollcommand=scroll.set)
+
+        txt.insert("1.0", "\n".join(lines))
+        txt.configure(state="disabled")
+
+        ttk.Button(win, text="Close", command=win.destroy).grid(row=1, column=0, pady=(0, 8))
+
+    def _apply_ideal_values(self):
+        """Copy the last analysis's recommendations onto the actual
+        controls. Disabled until an analysis has produced at least one
+        recommendation. Applied values become ordinary slider overrides —
+        "Reset to Defaults" discards them same as any manual tweak."""
+        if not self.last_recommendations:
+            return
+        for key, value in self.last_recommendations.items():
+            if key in self.vars:
+                self.vars[key].set(value)
+            self.state.params[key] = value
+        self._update_eq_canvas()
+        self.analysis_status.configure(text="Ideal values applied to the controls below.")
 
     def commit(self):
         for key, var in self.vars.items():
@@ -1391,15 +1918,272 @@ class Step5DSP(ttk.Frame):
         self._active = True
 
 
+def _fmt_mmss(seconds: float) -> str:
+    """Format a duration in seconds as M:SS for the player's time label."""
+    seconds = max(0, int(seconds))
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+class AudioPlayerPanel(ttk.LabelFrame):
+    """Play / pause / stop / seek preview for an audio file — used for
+    both the original input ("Play Original") and the finished output
+    ("Play Converted") on Step 6.
+
+    Streams the loaded track through sounddevice (via engine's `core.sd`,
+    the same backend `play_audio_preview` uses) with a manually-tracked
+    sample position so pausing and dragging the seek bar to a new spot
+    both work — `core.play_audio_preview` only supports uninterrupted
+    play/stop, not pause or mid-playback seeking.
+    """
+
+    def __init__(self, parent, title: str = "Play Converted",
+                 empty_status_text: str = "Run a conversion to preview the output here."):
+        super().__init__(parent, text=title)
+        self._empty_status_text = empty_status_text
+        self.columnconfigure(3, weight=1)
+
+        self.audio: "np.ndarray | None" = None
+        self.sr: int = 44100
+        self.duration_s: float = 0.0
+        self.pos: int = 0             # current playhead, in samples
+        self.playing: bool = False
+        self._stream = None
+        self._seeking = False
+        self._poll_id = None
+
+        self.play_btn = ttk.Button(self, text="▶ Play", command=self._play, state="disabled")
+        self.play_btn.grid(row=0, column=0, padx=(6, 4), pady=6)
+        self.pause_btn = ttk.Button(self, text="⏸ Pause", command=self._pause, state="disabled")
+        self.pause_btn.grid(row=0, column=1, padx=4, pady=6)
+        self.stop_btn = ttk.Button(self, text="■ Stop", command=self._stop, state="disabled")
+        self.stop_btn.grid(row=0, column=2, padx=4, pady=6)
+
+        self.seek_var = tk.DoubleVar(value=0.0)
+        self.seek_scale = ttk.Scale(
+            self, from_=0, to=100, variable=self.seek_var, orient="horizontal", state="disabled",
+        )
+        self.seek_scale.grid(row=0, column=3, sticky="ew", padx=6, pady=6)
+        self.seek_scale.bind("<ButtonPress-1>", self._seek_start)
+        self.seek_scale.bind("<ButtonRelease-1>", self._seek_end)
+
+        self.time_label = ttk.Label(self, text="0:00 / 0:00", width=12)
+        self.time_label.grid(row=0, column=4, padx=(0, 6))
+
+        self.status_label = ttk.Label(
+            self, text=empty_status_text,
+            foreground="#888888", font=("TkDefaultFont", 8),
+        )
+        self.status_label.grid(row=1, column=0, columnspan=5, sticky="w", padx=6, pady=(0, 4))
+
+    # -- loading -------------------------------------------------------
+
+    def load(self, path: Path):
+        """Load a finished output file for preview playback."""
+        self._stop()
+        self.audio = None
+        self.duration_s = 0.0
+        self.pos = 0
+        self.seek_var.set(0.0)
+        self._update_time_label()
+
+        if core is None or not core.CAP.numpy:
+            self.status_label.configure(text="Preview unavailable (numpy not installed).")
+            self._set_controls_enabled(False)
+            return
+        try:
+            seg = core.load_audio_file(path)
+            audio, sr = core.pydub_to_float32(seg)
+        except Exception as exc:
+            self.status_label.configure(text=f"Could not load output for preview: {exc}")
+            self._set_controls_enabled(False)
+            return
+
+        self.audio = audio
+        self.sr = sr
+        self.duration_s = (len(audio) / sr) if sr else 0.0
+        self.seek_scale.configure(to=max(self.duration_s, 0.1))
+        self._update_time_label()
+
+        if not core.CAP.sounddevice:
+            self.status_label.configure(
+                text=f"Loaded {path.name} — install 'sounddevice' to enable preview playback."
+            )
+            self._set_controls_enabled(False)
+            return
+
+        self.status_label.configure(text=f"Previewing: {path.name}")
+        self._set_controls_enabled(True)
+
+    def clear(self):
+        """Reset to the empty/no-output state (e.g. before a new run starts)."""
+        self._stop()
+        self.audio = None
+        self.duration_s = 0.0
+        self.pos = 0
+        self.seek_var.set(0.0)
+        self.seek_scale.configure(to=100)
+        self._update_time_label()
+        self.status_label.configure(text=self._empty_status_text)
+        self._set_controls_enabled(False)
+
+    def _set_controls_enabled(self, enabled: bool):
+        self.play_btn.configure(state="normal" if enabled else "disabled")
+        self.pause_btn.configure(state="disabled")
+        self.stop_btn.configure(state="disabled")
+        self.seek_scale.configure(state="normal" if enabled else "disabled")
+
+    # -- transport -------------------------------------------------------
+
+    def _play(self):
+        if self.audio is None or core is None or not core.CAP.sounddevice:
+            return
+        if self.playing:
+            return
+        if self.pos >= len(self.audio):
+            self.pos = 0
+        self._start_stream()
+        self.playing = True
+        self.play_btn.configure(state="disabled")
+        self.pause_btn.configure(state="normal")
+        self.stop_btn.configure(state="normal")
+        self._poll()
+
+    def _pause(self):
+        if not self.playing:
+            return
+        self._stop_stream()
+        self.playing = False
+        self.play_btn.configure(state="normal")
+        self.pause_btn.configure(state="disabled")
+        if self._poll_id:
+            self.after_cancel(self._poll_id)
+            self._poll_id = None
+
+    def _stop(self):
+        self._stop_stream()
+        self.playing = False
+        self.pos = 0
+        self.seek_var.set(0.0)
+        self._update_time_label()
+        has_audio = self.audio is not None and core is not None and core.CAP.sounddevice
+        self.play_btn.configure(state="normal" if has_audio else "disabled")
+        self.pause_btn.configure(state="disabled")
+        self.stop_btn.configure(state="disabled")
+        if self._poll_id:
+            self.after_cancel(self._poll_id)
+            self._poll_id = None
+
+    def _start_stream(self):
+        sd = core.sd
+        audio = self.audio
+        channels = audio.shape[1] if audio.ndim == 2 else 1
+
+        def callback(outdata, frames, time_info, status):
+            start = self.pos
+            end = min(start + frames, len(audio))
+            chunk = audio[start:end]
+            if audio.ndim == 1:
+                chunk = chunk.reshape(-1, 1)
+            if len(chunk) < frames:
+                outdata[:len(chunk)] = chunk
+                outdata[len(chunk):] = 0
+                self.pos = len(audio)
+                raise sd.CallbackStop()
+            outdata[:] = chunk
+            self.pos = end
+
+        self._stream = sd.OutputStream(
+            samplerate=self.sr, channels=channels, callback=callback, dtype="float32",
+            finished_callback=self._on_stream_finished,
+        )
+        self._stream.start()
+
+    def _on_stream_finished(self):
+        # Fires on a sounddevice-managed thread — marshal back to the Tk
+        # main thread before touching any widgets.
+        self.after(0, self._handle_stream_finished)
+
+    def _handle_stream_finished(self):
+        if self.playing and self.audio is not None and self.pos >= len(self.audio):
+            self._stop()
+
+    def _stop_stream(self):
+        if self._stream is not None:
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
+
+    # -- seeking -------------------------------------------------------
+
+    def _seek_start(self, _event):
+        self._seeking = True
+
+    def _seek_end(self, _event):
+        self._seeking = False
+        if self.audio is None:
+            return
+        target_s = self.seek_var.get()
+        self.pos = max(0, min(int(target_s * self.sr), len(self.audio)))
+        self._update_time_label()
+        if self.playing:
+            self._stop_stream()
+            self._start_stream()
+
+    # -- polling / display -------------------------------------------------------
+
+    def _poll(self):
+        if self.playing and not self._seeking:
+            self.seek_var.set(self.pos / self.sr if self.sr else 0.0)
+            self._update_time_label()
+        if self.playing:
+            self._poll_id = self.after(200, self._poll)
+
+    def _update_time_label(self):
+        cur = self.pos / self.sr if self.sr else 0.0
+        self.time_label.configure(text=f"{_fmt_mmss(cur)} / {_fmt_mmss(self.duration_s)}")
+
+    def on_leave(self):
+        """Stop any playback in progress (called when navigating away)."""
+        self._stop()
+
+
+class _QueueLogHandler(logging.Handler):
+    """Logging handler that forwards formatted INFO+ log records into a
+    wizard step's message queue, the same way `_log()` already forwards
+    hand-written progress/status lines from run_batch()/remaster_file().
+
+    Without this, only those explicit log_callback() lines show up in the
+    GUI's "Progress & Log" text area — every other log.info()/warning()
+    call scattered through engine.py (e.g. "Stereo output: …", "MKV
+    muxed: …") would only ever be visible on the CLI console or in the
+    rotating log file, never in the GUI.
+    """
+
+    def __init__(self, msg_queue: "queue.Queue", level: int = logging.INFO):
+        super().__init__(level=level)
+        self.msg_queue = msg_queue
+        self.setFormatter(logging.Formatter("%(asctime)s %(levelname)-8s %(message)s", datefmt="%H:%M:%S"))
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self.msg_queue.put_nowait(("log", self.format(record)))
+        except Exception:
+            pass
+
+
 # ---------------------------------------------------------------------------
 # Step 6 — Output & Run
 # ---------------------------------------------------------------------------
 
 class Step6Run(ttk.Frame):
-    def __init__(self, parent, state: WizardState, on_run_complete=None):
+    def __init__(self, parent, state: WizardState, on_run_complete=None, on_back=None):
         super().__init__(parent)
         self.state = state
         self.on_run_complete = on_run_complete
+        self.on_back = on_back
         self.columnconfigure(0, weight=1)
         self.rowconfigure(2, weight=1)
         self.msg_queue: queue.Queue = queue.Queue()
@@ -1452,19 +2236,49 @@ class Step6Run(ttk.Frame):
         self.progress = ttk.Progressbar(log_frame, mode="determinate")
         self.progress.grid(row=0, column=0, sticky="ew", padx=6, pady=6)
 
-        self.log_text = tk.Text(log_frame, height=10, wrap="word", state="disabled")
+        # height reduced to 75% of the original 10 rows
+        self.log_text = tk.Text(log_frame, height=7, wrap="word", state="disabled")
         self.log_text.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0, 6))
 
+        # Play Original — sits above Play Converted, populated whenever the
+        # step is entered with an input file selected (see on_enter() /
+        # _load_original_preview() below).
+        self.original_player = AudioPlayerPanel(
+            self, title="Play Original",
+            empty_status_text="Select an input file in Step 1 to preview the original here.",
+        )
+        self.original_player.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        self._original_loaded_signature: str | None = None
+
+        # Play Converted — populated once a run finishes (see
+        # _load_preview_from_report()).
+        self.player = AudioPlayerPanel(self, title="Play Converted")
+        self.player.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+
         btn_row = ttk.Frame(self)
-        btn_row.grid(row=3, column=0, sticky="ew", pady=(8, 0))
-        self.run_btn = ttk.Button(btn_row, text="Run", command=self._start_run)
-        self.run_btn.pack(side="left")
+        btn_row.grid(row=5, column=0, sticky="ew", pady=(8, 0))
+        self.back_btn = ttk.Button(btn_row, text="< Back", command=self._on_back_clicked)
+        self.back_btn.pack(side="left")
         self.cancel_btn = ttk.Button(btn_row, text="Cancel", command=self._cancel, state="disabled")
-        self.cancel_btn.pack(side="left", padx=(6, 0))
         self.open_btn = ttk.Button(btn_row, text="Open Output Folder", command=self._open_output, state="disabled")
-        self.open_btn.pack(side="left", padx=(6, 0))
+        self.run_btn = ttk.Button(btn_row, text="Run", command=self._start_run)
+        self.run_btn.pack(side="right")
+        self.open_btn.pack(side="right", padx=(0, 6))
+        self.cancel_btn.pack(side="right", padx=(0, 6))
+
+        # Forward the same INFO+ log messages that already appear on the
+        # CLI/console (and in the rotating log file) into this step's log
+        # text area, in addition to the hand-written progress/status lines
+        # already sent here via log_callback in _start_run()'s worker.
+        if core is not None:
+            self._log_handler = _QueueLogHandler(self.msg_queue)
+            core.log.addHandler(self._log_handler)
 
         self.after(200, self._poll_queue)
+
+    def _on_back_clicked(self):
+        if self.on_back:
+            self.on_back()
 
     # Friendly labels for the flat DSP/speaker-bias params dict, in the
     # order they should appear under "Mastering (DSP)" / "Surround Speaker Mapping".
@@ -1613,8 +2427,10 @@ class Step6Run(ttk.Frame):
         self.run_btn.configure(state="disabled")
         self.cancel_btn.configure(state="normal")
         self.open_btn.configure(state="disabled")
+        self.back_btn.configure(state="disabled")
         self.progress.configure(value=0, maximum=len(files))
         self._clear_log()
+        self.player.clear()
 
         params = self.state.resolve()
 
@@ -1683,6 +2499,7 @@ class Step6Run(ttk.Frame):
                 elif kind == "done":
                     report = item[1]
                     self._append_log(f"\nDone: {report.succeeded} succeeded, {report.failed} failed.\n")
+                    self._load_preview_from_report(report)
                     self._finish(success=True)
                 elif kind == "error":
                     self._append_log(f"\nERROR:\n{item[1]}\n")
@@ -1696,8 +2513,55 @@ class Step6Run(ttk.Frame):
         self.run_btn.configure(state="normal")
         self.cancel_btn.configure(state="disabled")
         self.open_btn.configure(state="normal")
+        self.back_btn.configure(state="normal")
         if self.on_run_complete:
             self.on_run_complete(success)
+
+    def _load_preview_from_report(self, report):
+        """Point the preview player at the first successfully-produced
+        output file (preferring a directly-playable stereo file over a
+        5.1 MKV, which pydub/ffmpeg can still often open, but the stereo
+        file is the more universally reliable preview source)."""
+        for fr in report.files:
+            if fr.success and fr.output_paths:
+                candidates = [Path(p) for p in fr.output_paths]
+                preferred = next((p for p in candidates if p.suffix.lower() != ".mkv"), candidates[0])
+                self.player.load(preferred)
+                return
+        self.player.status_label.configure(text="No output was produced to preview.")
+
+    def _load_original_preview(self):
+        """Point the Play Original player at the first input file, if any.
+        Cheap no-op if the input selection hasn't changed since the last
+        time this ran (see on_enter())."""
+        if not self.state.input_path or core is None:
+            self.original_player.clear()
+            return
+        try:
+            files = core.collect_audio_files(Path(self.state.input_path))
+        except Exception:
+            files = []
+        if not files:
+            self.original_player.clear()
+            self.original_player.status_label.configure(text="No input file found to preview.")
+            return
+        self.original_player.load(files[0])
+
+    def on_enter(self):
+        """Called by the wizard controller when this step becomes visible.
+        Reloads the Play Original preview only if the input selection
+        actually changed since the last visit (e.g. the user went back to
+        Step 1 and picked a different file/folder)."""
+        signature = f"{self.state.input_mode}:{self.state.input_path}"
+        if signature != self._original_loaded_signature:
+            self._original_loaded_signature = signature
+            self._load_original_preview()
+
+    def on_leave(self):
+        """Called by the wizard controller when navigating away from this
+        step. Stops any in-progress preview playback."""
+        self.original_player.on_leave()
+        self.player.on_leave()
 
     def _clear_log(self):
         self.log_text.configure(state="normal")
@@ -1756,7 +2620,7 @@ class WizardController:
             Step3Content(self.container, self.state),
             Step4Enhancement(self.container, self.state),
             Step5DSP(self.container, self.state),
-            Step6Run(self.container, self.state, on_run_complete=self._on_run_complete),
+            Step6Run(self.container, self.state, on_run_complete=self._on_run_complete, on_back=self._go_back),
         ]
         for page in self.pages:
             page.grid(row=0, column=0, sticky="nsew")
@@ -1837,13 +2701,15 @@ class WizardController:
         self.current_step = index
         self.pages[index].tkraise()
         self.step_label.configure(text=f"Step {index + 1} of 6 — {self.STEP_NAMES[index]}")
-        self.back_btn.configure(state="disabled" if index == 0 else "normal")
         if index == len(self.pages) - 1:
-            # Step 6 has its own Run button — the bottom-right nav "Run >"
-            # button is redundant there and stayed visible/greyed-out
-            # before; now it's hidden entirely (change #8).
+            # Step 6 renders its own Back/Cancel/Open Output Folder/Run row,
+            # so the global nav bar's Back and Run ">" buttons are both
+            # redundant there — hide them entirely.
+            self.back_btn.pack_forget()
             self.next_btn.pack_forget()
         else:
+            self.back_btn.configure(state="disabled" if index == 0 else "normal")
+            self.back_btn.pack(side="left")
             self.next_btn.configure(text="Next >", state="normal")
             self.next_btn.pack(side="right")
 
@@ -1899,6 +2765,33 @@ class WizardController:
         self.root.destroy()
 
 
+def _set_app_icon(root: tk.Tk) -> None:
+    """Set the window/title-bar/taskbar icon to a small flat cassette-tape
+    graphic, decoded from the embedded base64 PNG data (_APP_ICON_PNG_B64)
+    above. Multiple sizes are supplied so Tk can pick the best match for
+    the title bar, alt-tab switcher, and taskbar respectively. Never
+    raises — a missing/broken icon should never stop the app from
+    starting.
+    """
+    try:
+        images = [
+            tk.PhotoImage(data=b64, format="png", master=root)
+            for b64 in _APP_ICON_PNG_B64.values()
+        ]
+        if images:
+            root.iconphoto(True, *images)
+            # Keep references alive — Tk drops the image if it's garbage
+            # collected, which would silently blank the icon.
+            root._app_icon_images = images
+    except Exception as exc:
+        try:
+            log_fn = core.log.debug if core is not None else None
+        except Exception:
+            log_fn = None
+        if log_fn:
+            log_fn("Could not set app icon: %s", exc)
+
+
 def _increase_default_fonts(delta: int = 1):
     for name in ("TkDefaultFont", "TkTextFont", "TkHeadingFont"):
         try:
@@ -1938,6 +2831,7 @@ def _load_core_and_launch(root: tk.Tk, splash: ttk.Frame, bar: ttk.Progressbar):
 def main():
     root = tk.Tk()
     root.title("OpenRemaster")
+    _set_app_icon(root)
     _increase_default_fonts(1)
 
     # Loading screen: shown immediately, before the (potentially slow)

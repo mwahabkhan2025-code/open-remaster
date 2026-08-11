@@ -138,6 +138,22 @@ class ContentProfile:
     final_lufs_override: float | None = None  # None = use DeviceProfile.final_lufs
     headroom_db_override: float | None = None
 
+    # --- Explicit device-override vetoes ---
+    # Most content profiles leave multiband_compress/saturation at their
+    # dataclass default (False) simply because they never took a position
+    # on it — for those, the device profile's own hardware-protective
+    # choice (e.g. bluetooth_speaker enabling gentle multiband compression
+    # to keep small drivers from breaking up) should still win, same as
+    # before. A few profiles (Carnatic/Hindustani, devotional/folk,
+    # modern-mastered) DO take an explicit position — "preserve dynamics",
+    # "don't compress hard", "don't compound what's already mastered" —
+    # and that position should not be silently overridden just because a
+    # loud soundbar or Bluetooth speaker profile wants compression/warmth
+    # for its own hardware reasons. These two flags let a content profile
+    # say "no, really, don't" instead of only being able to say "yes".
+    veto_device_multiband: bool = False
+    veto_device_saturation: bool = False
+
 
 # ---------------------------------------------------------------------------
 # Defined content profiles
@@ -315,6 +331,12 @@ CONTENT_PROFILES: dict[ContentKey, ContentProfile] = {
         treble_correction_db=0.0,
         saturation=False,
         final_lufs_override=None,
+        # "Less aggressive processing to avoid compounding what the
+        # original mastering already did" (see class docstring) is an
+        # explicit veto on saturation specifically — a device profile's
+        # own warmth/character choice shouldn't be layered on top of a
+        # recording that's already been mastered once.
+        veto_device_saturation=True,
     ),
 
     "carnatic_hindustani": ContentProfile(
@@ -346,6 +368,11 @@ CONTENT_PROFILES: dict[ContentKey, ContentProfile] = {
         saturation=False,
         final_lufs_override=-18.0,  # wider dynamic range for classical
         headroom_db_override=1.0,
+        # "Preserve dynamics and timbre above all" (see class docstring) is
+        # an explicit veto, not just an unset default — don't let a device
+        # profile's own compression/saturation defaults override it.
+        veto_device_multiband=True,
+        veto_device_saturation=True,
     ),
 
     "devotional_folk": ContentProfile(
@@ -386,6 +413,10 @@ CONTENT_PROFILES: dict[ContentKey, ContentProfile] = {
         saturation=False,
         final_lufs_override=-16.0,      # a bit wider than pop mastering
         headroom_db_override=0.5,
+        # "Dynamics kept natural rather than compressed hard" is an
+        # explicit veto on multiband compression, not just an unset
+        # default — see class docstring.
+        veto_device_multiband=True,
     ),
 
     "bgm": ContentProfile(

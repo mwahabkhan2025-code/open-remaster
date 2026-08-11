@@ -60,15 +60,32 @@ def resolve_profile(
     p["bass_shelf_db"]   = dp.bass_shelf_db + cp.bass_correction_db
     p["treble_shelf_hz"] = dp.treble_shelf_hz
     p["treble_shelf_db"] = dp.treble_shelf_db + cp.treble_correction_db
-    p["presence_hz"]     = dp.presence_hz
-    p["presence_db"]     = dp.presence_db + cp.vocal_presence_db
+
+    # Device may set presence_hz=0 to mean "no hardware presence boost".
+    # Content still contributes vocal_presence_db for non-stem paths, so
+    # fall back to a standard presence centre frequency when the device
+    # left hz at 0 but there is a non-zero total presence gain to apply.
+    total_presence = dp.presence_db + cp.vocal_presence_db
+    p["presence_db"] = total_presence
+    p["presence_hz"] = dp.presence_hz if dp.presence_hz > 0 else (
+        2800.0 if total_presence != 0.0 else 0.0
+    )
     p["presence_q"]      = dp.presence_q
     p["notch_hz"]        = dp.notch_hz
     p["notch_db"]        = dp.notch_db
     p["notch_q"]         = dp.notch_q
 
     # --- Dynamics: content-driven (it knows the source material) ---
-    p["multiband_compress"] = cp.multiband_compress or dp.multiband_compress
+    # Normally either side enabling multiband compression is enough (a
+    # device may want it purely to protect small drivers, independent of
+    # content). But a handful of content profiles take an EXPLICIT stance
+    # against compression ("preserve dynamics", "don't compress hard") —
+    # veto_device_multiband lets those override a device's own defaults
+    # rather than being silently re-enabled by them.
+    p["multiband_compress"] = (
+        False if cp.veto_device_multiband
+        else (cp.multiband_compress or dp.multiband_compress)
+    )
     # If both define multiband, take the more aggressive ratios
     p["mb_low_ratio"]         = max(dp.mb_low_ratio,  cp.mb_low_ratio)
     p["mb_mid_ratio"]         = max(dp.mb_mid_ratio,  cp.mb_mid_ratio)
@@ -76,15 +93,23 @@ def resolve_profile(
     p["mb_low_crossover_hz"]  = dp.mb_low_crossover_hz
     p["mb_high_crossover_hz"] = dp.mb_high_crossover_hz
 
-    # --- Saturation: content wins (source material determines need) ---
-    p["saturation"]          = cp.saturation or dp.saturation
-    p["saturation_drive_db"] = cp.saturation_drive_db if cp.saturation else dp.saturation_drive_db
-    p["saturation_mix"]      = cp.saturation_mix      if cp.saturation else dp.saturation_mix
+    # --- Saturation: content wins when it requests saturation; otherwise
+    # fall through to device values when only the device enables it —
+    # UNLESS the content profile explicitly vetoes saturation (e.g.
+    # modern-mastered material that shouldn't get a device's warmth
+    # coloring stacked on top of an already-finished master). ---
+    p["saturation"] = False if cp.veto_device_saturation else (cp.saturation or dp.saturation)
+    if cp.saturation:
+        p["saturation_drive_db"] = cp.saturation_drive_db
+        p["saturation_mix"]      = cp.saturation_mix
+    else:
+        p["saturation_drive_db"] = dp.saturation_drive_db
+        p["saturation_mix"]      = dp.saturation_mix
 
     # --- Stereo / surround spatial ---
     p["width_bands"]            = dp.width_bands
     p["width_bass"]             = dp.width_bass
-    p["width_mid"]               = dp.width_mid
+    p["width_mid"]              = dp.width_mid
     p["width_treble"]           = dp.width_treble
     p["crystalizer"]            = dp.crystalizer
     p["crystalizer_intensity"]  = dp.crystalizer_intensity
