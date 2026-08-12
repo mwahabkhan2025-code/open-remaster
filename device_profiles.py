@@ -48,6 +48,7 @@ DeviceKey = Literal[
     "bluetooth_speaker",
     "soundbar_stereo",
     "soundbar_2_1",
+    "soundbar_2_2",
     "home_theatre_2_1",
     "home_theatre_5_1",
     "headphones",
@@ -271,6 +272,53 @@ DEVICE_PROFILES: dict[DeviceKey, DeviceProfile] = {
         crossfeed=False,
         width_bands=True,
         width_bass=1.0,
+        width_mid=1.2,
+        width_treble=1.3,
+    ),
+
+    "soundbar_2_2": DeviceProfile(
+        key="soundbar_2_2",
+        display_name="Soundbar (2.2, dual sub)",
+        description=(
+            "Soundbar with two subwoofers (often one per side, or a pair "
+            "of wireless units) rather than a single sub. Bass shelving "
+            "stays flat here for the same reason as the 2.1 profile — the "
+            "subs handle the low end — but with two subs splitting the "
+            "load there's less risk of a single unit being pushed into "
+            "boom or clipping, so multiband bass compression can be a "
+            "touch gentler than the 2.1 profile. Still no centre channel, "
+            "so a presence boost for vocals stays. Two subs also usually "
+            "means better stereo bass separation than a single central "
+            "sub, so bass width isn't forced to mono the way some 2.1 "
+            "setups effectively are."
+        ),
+        layout="stereo",
+        output_format="mp3",
+        bitrate="320k",
+        also_produce_stereo_mp3=False,
+        final_lufs=-15.0,
+        headroom_db=0.5,
+        auto_loudness=False,
+        bass_shelf_hz=100.0,
+        bass_shelf_db=0.0,         # dual subs handle bass — don't double up
+        treble_shelf_hz=8000.0,
+        treble_shelf_db=1.0,
+        presence_hz=2800.0,
+        presence_db=1.5,
+        presence_q=1.2,
+        notch_hz=0.0,
+        multiband_compress=True,
+        mb_low_ratio=1.6,          # gentler than soundbar_2_1's 1.8 — load is split across two subs
+        mb_mid_ratio=1.6,
+        mb_high_ratio=1.5,
+        mb_low_crossover_hz=200,
+        mb_high_crossover_hz=4000,
+        saturation=False,
+        crystalizer=True,
+        crystalizer_intensity=1.5,
+        crossfeed=False,
+        width_bands=True,
+        width_bass=1.1,            # dual subs can carry some stereo bass separation, unlike a single-sub 2.1 setup
         width_mid=1.2,
         width_treble=1.3,
     ),

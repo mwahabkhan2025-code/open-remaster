@@ -1216,6 +1216,34 @@ def _save_stem_cache(
 
 # --- Demucs separation (Python API, not subprocess) ---
 
+# In-process cache of loaded Demucs models, keyed by (model_name, device).
+# Loading a model reads its weights off disk and moves them to the target
+# device -- by far the slowest fixed cost per separate_stems() call. In a
+# sequential batch that reuses the same model (the common case), every
+# file after the first can reuse the already-loaded object instead of
+# paying that cost again. Not shared across ProcessPoolExecutor workers
+# (each process gets its own cache), but still a full win for the default
+# single-process/sequential batch path.
+_DEMUCS_MODEL_CACHE: dict[tuple[str, str], Any] = {}
+
+
+def _get_demucs_model(model: str, device: str):
+    """Return a cached Demucs model for (model, device), loading it once."""
+    key = (model, device)
+    cached = _DEMUCS_MODEL_CACHE.get(key)
+    if cached is not None:
+        log.debug("Demucs model cache hit: %s (%s)", model, device)
+        return cached
+
+    from demucs.pretrained import get_model
+    log.info("Loading Demucs model: %s …", model)
+    demucs_model = get_model(model)
+    demucs_model.to(device)
+    demucs_model.eval()
+    _DEMUCS_MODEL_CACHE[key] = demucs_model
+    return demucs_model
+
+
 def separate_stems(
     input_path: Path,
     model: str = "htdemucs",
@@ -1246,14 +1274,10 @@ def separate_stems(
 
     try:
         import torch
-        from demucs.pretrained import get_model
         from demucs.apply import apply_model
         from demucs.audio import AudioFile
 
-        log.info("Loading Demucs model: %s …", model)
-        demucs_model = get_model(model)
-        demucs_model.to(device)
-        demucs_model.eval()
+        demucs_model = _get_demucs_model(model, device)
         model_sr = int(demucs_model.samplerate)
 
         log.info("Separating: %s (model SR=%d)", input_path.name, model_sr)

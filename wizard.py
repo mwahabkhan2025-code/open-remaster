@@ -18,6 +18,7 @@ import json
 import logging
 import math
 import queue
+import struct
 import threading
 import traceback
 import tkinter as tk
@@ -680,6 +681,28 @@ class WizardState:
         p.setdefault("lufs_range", 11.0)
         return p
 
+    def reset_for_new_song(self):
+        """Reset every downstream (Step 2-6) selection back to its default.
+        Called when the input file/folder actually changes on Step 1 —
+        content type, DSP overrides, and per-track analysis results were
+        all tuned to (or measured from) the PREVIOUS song, so carrying
+        them into a new one is more likely to mislead than help."""
+        self.device_key = ""
+        self.content_key = ""
+        self.content_auto_detected = ""
+        self.content_confidence = 0.0
+        self.demucs_model = "htdemucs"
+        self.use_cache = True
+        self.use_voicefixer = False
+        self.use_deepfilternet = False
+        self.experimental_ack = False
+        self.params = {}
+        self.trim_silence = False
+        self.fade_in_ms = 0
+        self.fade_out_ms = 0
+        self.surround_codec = "ac3"
+        self.lfe_mode = "gentle"
+
     def save(self):
         save_config({
             "input_path": self.input_path, "input_mode": self.input_mode,
@@ -907,6 +930,7 @@ class Step2Device(ttk.Frame):
         grid.grid(row=1, column=0, sticky="nsew")
 
         keys = list(DEVICE_PROFILES.keys())
+        self._keys = keys
         num_cols = 2 if len(keys) <= 6 else 3
         num_rows = math.ceil(len(keys) / num_cols)
         for c in range(num_cols):
@@ -932,6 +956,12 @@ class Step2Device(ttk.Frame):
         self.state.device_key = key
         for k, card in self.cards.items():
             card._set_style(k == key)
+
+    def reset_to_default(self):
+        """Re-select the first device tile, mirroring the initial
+        pre-selection this page does on its very first display."""
+        if self._keys:
+            self._select(self._keys[0])
 
     def commit(self):
         pass  # already committed via _select
@@ -1028,6 +1058,20 @@ class Step3Content(ttk.Frame):
         for k, card in self.cards.items():
             card._set_style(k == key)
 
+    def reset_to_default(self):
+        """Clear the previous song's detection result/selection and force
+        run_detection() to actually re-run against the new input next time
+        this step is shown, instead of short-circuiting on its cached
+        'already detected' flag."""
+        self.state.content_key = ""
+        self.state.content_auto_detected = ""
+        self.state.content_confidence = 0.0
+        self.badge.configure(text="", fg="black")
+        for card in self.cards.values():
+            card._set_style(False)
+        self._detected = False
+        self._detected_input = None
+
     def commit(self):
         pass
 
@@ -1113,6 +1157,16 @@ class Step4Enhancement(ttk.Frame):
         self.state.experimental_ack = self.ack_var.get()
         self.state.use_voicefixer = self.vf_var.get()
         self.state.use_deepfilternet = self.dfn_var.get()
+
+    def reset_to_default(self):
+        self.model_var.set("htdemucs")
+        self.cache_var.set(True)
+        self.ack_var.set(False)
+        self.vf_var.set(False)
+        self.dfn_var.set(False)
+        if self.exp_expanded.get():
+            self.exp_expanded.set(False)
+            self._toggle_experimental()
 
     def validate(self) -> str | None:
         return None
@@ -1768,6 +1822,25 @@ class Step5DSP(ttk.Frame):
         for group_key, (source_var, db_var, key_by_label) in self.speaker_bias_vars.items():
             self.state.params[f"speaker_bias_{group_key}"] = key_by_label.get(source_var.get(), "off")
             self.state.params[f"speaker_bias_{group_key}_db"] = db_var.get()
+
+    def reset_to_default(self):
+        """Clear per-track analysis results ("Ideal: …" labels) and any
+        manual slider overrides, and force the next refresh_profile_label()
+        to treat this as a brand-new device/content profile so it rebuilds
+        every control from the profile's real defaults instead of quietly
+        preserving values that belonged to the previous song."""
+        self.state.params = {}
+        self.last_recommendations = {}
+        self.last_measurements = {}
+        self._update_ideal_labels()
+        self.analysis_status.configure(text="")
+        self.apply_ideal_btn.configure(state="disabled")
+        self.analysis_info_btn.configure(state="disabled")
+        self.trim_var.set(False)
+        self.fade_in_var.set(0)
+        self.fade_out_var.set(0)
+        self.preview_status.configure(text="Not previewed yet.")
+        self._last_profile_signature = None
 
     def validate(self) -> str | None:
         return None
@@ -2578,6 +2651,19 @@ class Step6Run(ttk.Frame):
         self.state.surround_codec = self.codec_var.get()
         self.state.lfe_mode = self.lfe_var.get()
 
+    def reset_to_default(self):
+        """Clear the previous song's run log/progress/preview and force
+        the Play Original panel to reload against the new input next time
+        this step is shown."""
+        self.codec_var.set("ac3")
+        self.lfe_var.set("gentle")
+        self._clear_log()
+        self.progress.configure(value=0)
+        self.open_btn.configure(state="disabled")
+        self.player.clear()
+        self.original_player.clear()
+        self._original_loaded_signature = None
+
     def validate(self) -> str | None:
         return None
 
@@ -2732,14 +2818,38 @@ class WizardController:
         if on_leave:
             on_leave()
 
+    def _reset_song_dependent_state(self):
+        """The input file/folder changed on Step 1 — every downstream
+        selection (content type, DSP overrides, analysis 'ideal' values,
+        enhancement toggles, run log/previews) was tuned to the OLD song,
+        so reset each step back to its defaults rather than silently
+        carrying stale, song-specific choices into the new one."""
+        self.state.reset_for_new_song()
+        for page in self.pages[1:]:
+            reset_fn = getattr(page, "reset_to_default", None)
+            if reset_fn:
+                reset_fn()
+
     def _go_next(self):
         page = self.pages[self.current_step]
         err = page.validate()
         if err:
             messagebox.showerror("Cannot continue", err)
             return
+
+        input_changed = False
+        if self.current_step == 0:
+            old_signature = f"{self.state.input_mode}:{self.state.input_path}"
+
         page.commit()
+
+        if self.current_step == 0:
+            new_signature = f"{self.state.input_mode}:{self.state.input_path}"
+            input_changed = new_signature != old_signature
+
         self._leave_current_step()
+        if input_changed:
+            self._reset_song_dependent_state()
         self.state.save()
         if self.current_step < len(self.pages) - 1:
             self._show_step(self.current_step + 1)
@@ -2763,6 +2873,91 @@ class WizardController:
         self.state.cleanup_and_save()
         core.stop_audio_preview()
         self.root.destroy()
+
+
+def _set_windows_app_id() -> None:
+    """Windows groups taskbar entries (and picks the icon shown there) by
+    AppUserModelID, not by window icon alone. A script launched via
+    `python wizard.py` inherits python.exe's own AppUserModelID by
+    default, which is why the taskbar can keep showing the interpreter's
+    icon even after the title bar icon is set correctly with iconphoto()
+    below. Setting an explicit, unique ID here — before the Tk window is
+    created — detaches the process from that default grouping so our own
+    icon is used for the taskbar entry too. No-op on non-Windows
+    platforms; never raises.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "OpenRemaster.Wizard.1"
+        )
+    except Exception:
+        pass
+
+
+def _build_ico_bytes(png_images: list[tuple[int, bytes]]) -> bytes:
+    """Assemble a Windows .ico file directly from already-PNG-encoded
+    image data, with no image-decoding library required.
+
+    Windows has supported PNG-compressed frames inside .ico containers
+    since Vista, so the existing PNG bytes (same data iconphoto() uses)
+    can be embedded byte-for-byte — this just writes the small binary
+    ICONDIR + ICONDIRENTRY header around them (stdlib `struct` only).
+
+    png_images: list of (size, png_bytes) where size is the square
+    image's width/height in pixels (must be < 256 — true for all sizes
+    in _APP_ICON_PNG_B64).
+    """
+    count = len(png_images)
+    header = struct.pack("<HHH", 0, 1, count)  # reserved, type=icon, count
+
+    entries = bytearray()
+    data = bytearray()
+    offset = 6 + count * 16  # ICONDIR (6 bytes) + one ICONDIRENTRY (16 bytes) each
+
+    for size, png_bytes in png_images:
+        entries += struct.pack(
+            "<BBBBHHII",
+            size, size,   # width, height (a byte value of 0 would mean 256px;
+                          # none of our sizes reach that)
+            0, 0,         # colour count (0 = not palette-based), reserved
+            1, 32,        # colour planes, bits per pixel (32 = RGBA)
+            len(png_bytes), offset,
+        )
+        data += png_bytes
+        offset += len(png_bytes)
+
+    return header + bytes(entries) + bytes(data)
+
+
+def _set_windows_taskbar_icon(root: tk.Tk) -> None:
+    """Build a multi-resolution .ico from the same embedded PNG data used
+    for iconphoto() and set it via iconbitmap(). Windows' taskbar reads
+    the .ico set through iconbitmap far more reliably than the PNGs
+    passed to iconphoto (which mostly cover the title bar and alt-tab
+    switcher there) — this is the second half of the taskbar icon fix,
+    alongside _set_windows_app_id() above. Builds the .ico directly from
+    the existing PNG bytes (see _build_ico_bytes()) — no imaging library
+    needed. No-op on non-Windows platforms; never raises.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        png_images = [
+            (size, base64.b64decode(b64))
+            for size, b64 in _APP_ICON_PNG_B64.items()
+        ]
+        if not png_images:
+            return
+        ico_bytes = _build_ico_bytes(png_images)
+        ico_path = Path.home() / ".openremaster" / "app_icon.ico"
+        ico_path.parent.mkdir(parents=True, exist_ok=True)
+        ico_path.write_bytes(ico_bytes)
+        root.iconbitmap(default=str(ico_path))
+    except Exception:
+        pass
 
 
 def _set_app_icon(root: tk.Tk) -> None:
@@ -2790,6 +2985,19 @@ def _set_app_icon(root: tk.Tk) -> None:
             log_fn = None
         if log_fn:
             log_fn("Could not set app icon: %s", exc)
+
+    # Windows taskbar entries specifically need the .ico-based path below
+    # (iconphoto above mainly covers the title bar there) — see
+    # _set_windows_taskbar_icon()'s docstring for why.
+    try:
+        _set_windows_taskbar_icon(root)
+    except Exception as exc:
+        try:
+            log_fn = core.log.debug if core is not None else None
+        except Exception:
+            log_fn = None
+        if log_fn:
+            log_fn("Could not set Windows taskbar icon: %s", exc)
 
 
 def _increase_default_fonts(delta: int = 1):
@@ -2829,6 +3037,11 @@ def _load_core_and_launch(root: tk.Tk, splash: ttk.Frame, bar: ttk.Progressbar):
 
 
 def main():
+    # Must run before Tk() is created — see _set_windows_app_id()'s
+    # docstring for why (taskbar grouping/icon is decided at process
+    # registration time, not window-creation time).
+    _set_windows_app_id()
+
     root = tk.Tk()
     root.title("OpenRemaster")
     _set_app_icon(root)
